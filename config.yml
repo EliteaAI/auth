@@ -1,0 +1,2 @@
+# Register API endpoints (pylon_main serves admin APIs)
+register_api: true
