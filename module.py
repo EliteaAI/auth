@@ -737,6 +737,7 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
                     if value:
                         result.append((role, mode, perm))
             self.local_permissions.update(generate_permissions_from_string(perm))
+            self.local_permissions.add(perm)
 
         if result:
             self.insert_permissions(result)
