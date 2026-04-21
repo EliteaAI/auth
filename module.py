@@ -382,6 +382,18 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
 
     def preload(self):
         """ Preload handler """
+        noop_decorator = lambda *args, **kwargs: lambda func: func
+        #
+        self.decorators.check = noop_decorator
+        self.decorators.check_api = noop_decorator
+        self.decorators.check_slot = noop_decorator
+        #
+        self.decorators.sio_connect = noop_decorator
+        self.decorators.sio_disconnect = noop_decorator
+        self.decorators.sio_check = noop_decorator
+        #
+        self.current_user = lambda *args, **kwargs: None
+        #
         self.descriptor.register_tool("auth", self)
 
     def init(self):
