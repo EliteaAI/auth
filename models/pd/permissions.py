@@ -3,6 +3,7 @@ from pydantic.v1 import BaseModel
 
 class ModeRoles(BaseModel):
     system: bool = True
+    super_admin: bool = True
     admin: bool = True
     editor: bool = False
     viewer: bool = False
