@@ -45,7 +45,8 @@ class API(api_tools.APIBase):
     @register_openapi(
         name="Get Current User",
         description="Get information about the currently authenticated user.",
-        mcp_tool=True
+        mcp_tool=True,
+        available_to_users=True,
     )
     @api_tools.endpoint_metrics
     def get(self, **kwargs):
