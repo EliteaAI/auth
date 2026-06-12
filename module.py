@@ -257,6 +257,27 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         # Redis cache for auth_authorize (under load optimization)
         self._redis_client = None
         self._auth_cache_ttl = 60  # seconds
+        # Single-flight Redis cache for resolve_permissions hot path
+        self._permissions_cache_ttl = 300  # seconds; permissions change rarely
+        # Bounded LRU of per-key locks so the dict can't grow without limit
+        # (thousands of users x projects x modes). Evicted locks just mean a
+        # future miss for that key re-creates a fresh lock — harmless.
+        self._perms_singleflight_locks = cachetools.LRUCache(maxsize=4096)
+        self._perms_lock_acquire_timeout = 2.0  # seconds; fall back to own fetch if exceeded
+        # Use gevent-aware semaphore only when gevent is actually monkey-patched
+        # and running (not merely installed). Under gunicorn threaded workers or
+        # in tests, gevent may be importable but not active — using gevent locks
+        # in that context would deadlock. Both semaphore types expose the same
+        # acquire(timeout=) / release() interface.
+        try:
+            from gevent import monkey as _monkey  # pylint: disable=C0415,E0401
+            if _monkey.is_module_patched("threading"):
+                from gevent.lock import BoundedSemaphore as _BoundedSemaphore  # pylint: disable=C0415,E0401
+            else:
+                from threading import BoundedSemaphore as _BoundedSemaphore  # pylint: disable=C0415
+        except ImportError:
+            from threading import BoundedSemaphore as _BoundedSemaphore  # pylint: disable=C0415
+        self._perms_lock_guard = _BoundedSemaphore(1)  # serializes per-key lock creation
 
     #
     # Redis auth cache helpers
@@ -320,6 +341,128 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
                 self._redis_client = False  # Mark as failed, don't retry
         #
         return self._redis_client if self._redis_client else None
+
+    #
+    # Single-flight Redis permissions cache
+    #
+
+    @staticmethod
+    def _permissions_cache_key(kind: str, principal_id, mode, project_id) -> str:
+        """ Build a Redis key for a permission lookup """
+        return f"auth:perms:{kind}:{principal_id}:{mode}:{project_id}"
+
+    def _perms_get(self, cache_key: str):
+        """ Read permissions from Redis. Returns set on hit, None on miss. """
+        redis_client = self.get_cache_redis_client()
+        if not redis_client:
+            return None
+        try:
+            cached = redis_client.get(cache_key)
+            if cached is not None:
+                return set(json.loads(cached))
+        except Exception as e:  # pylint: disable=W0718
+            log.error(f"[PERMS_CACHE] get failed: {e}")
+        return None
+
+    def _perms_set(self, cache_key: str, permissions: set) -> None:
+        """ Write permissions to Redis with TTL. """
+        redis_client = self.get_cache_redis_client()
+        if not redis_client:
+            return
+        try:
+            redis_client.setex(
+                cache_key, self._permissions_cache_ttl, json.dumps(sorted(permissions))
+            )
+        except Exception as e:  # pylint: disable=W0718
+            log.error(f"[PERMS_CACHE] set failed: {e}")
+
+    def _perms_lock(self, cache_key: str):
+        """ Per-key single-flight lock so only one greenlet fetches on a miss.
+
+        Locks live in a bounded LRUCache (capped, so no unbounded growth). A
+        module-level guard serializes lock creation so two greenlets racing on
+        the same cold key can't end up with two different locks.
+        """
+        lock = self._perms_singleflight_locks.get(cache_key)
+        if lock is None:
+            try:
+                from gevent import monkey as _monkey  # pylint: disable=C0415,E0401
+                if _monkey.is_module_patched("threading"):
+                    from gevent.lock import BoundedSemaphore  # pylint: disable=C0415,E0401
+                else:
+                    from threading import BoundedSemaphore  # pylint: disable=C0415
+            except ImportError:
+                from threading import BoundedSemaphore  # pylint: disable=C0415
+            with self._perms_lock_guard:
+                lock = self._perms_singleflight_locks.get(cache_key)
+                if lock is None:
+                    lock = BoundedSemaphore(1)
+                    self._perms_singleflight_locks[cache_key] = lock
+        return lock
+
+    def _resolve_permissions_cached(self, kind, resolver, principal_id, mode, project_id) -> set:
+        """ Single-flight cached permission resolution.
+
+        1. Try Redis (fast path, the 95% case once warm).
+        2. On miss, try to acquire a per-key lock so only ONE greenlet calls the
+           RPC; the others wait, then re-read the value the winner populated.
+        3. If the lock can't be acquired within a short timeout, fall back to
+           doing our own fetch. This caps worst-case behaviour at "same as no
+           single-flight" instead of a thundering-herd unblock that breaches
+           client timeouts all at once under a cold-start burst.
+        4. Never cache failures (a failed RPC must not poison the cache with 403s).
+        """
+        cache_key = self._permissions_cache_key(kind, principal_id, mode, project_id)
+        #
+        cached = self._perms_get(cache_key)
+        if cached is not None:
+            return cached
+        #
+        lock = self._perms_lock(cache_key)
+        acquired = lock.acquire(timeout=self._perms_lock_acquire_timeout)
+        try:
+            if acquired:
+                # Double-check: the lock holder before us may have populated it
+                cached = self._perms_get(cache_key)
+                if cached is not None:
+                    return cached
+            #
+            permissions = resolver(principal_id, mode=mode, project_id=project_id)
+            self._perms_set(cache_key, permissions)
+            return permissions
+        finally:
+            if acquired:
+                lock.release()
+
+    def _invalidate_permissions_cache(self) -> None:
+        """ Drop all cached permission entries (called on permission mutations). """
+        # Clear in-process cachetools layers too so they can't refill Redis with stale data
+        try:
+            self.get_user_permissions_cache.clear()
+            self.get_token_permissions_cache.clear()
+        except Exception as e:  # pylint: disable=W0718
+            log.error(f"[PERMS_CACHE] local clear failed: {e}")
+        #
+        redis_client = self.get_cache_redis_client()
+        if not redis_client:
+            return
+        try:
+            deleted = 0
+            for key in redis_client.scan_iter(match="auth:perms:*", count=500):
+                redis_client.delete(key)
+                deleted += 1
+            log.debug(f"[PERMS_CACHE] invalidated {deleted} entries")
+        except Exception as e:  # pylint: disable=W0718
+            log.error(f"[PERMS_CACHE] invalidation failed: {e}")
+
+    def _wrap_perms_invalidation(self, func):
+        """ Wrap a mutation proxy so the permissions cache is busted on success. """
+        @functools.wraps(func)
+        def _wrapped(*args, **kwargs):
+            result = func(*args, **kwargs)
+            self._invalidate_permissions_cache()
+            return result
+        return _wrapped
 
     def _get_auth_cache_key(self, cookies: dict, headers: dict = None) -> Optional[str]:
         """ Generate cache key from session cookie or Authorization header """
@@ -417,6 +560,23 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
                 raise RuntimeError(f"Name '{proxy_name}' is already set")
             #
             setattr(self, proxy_name, getattr(rpc_call, rpc_name))
+        #
+        # Bust the permissions cache after any mutation that changes
+        # what permissions resolve to. These are admin/write actions (low frequency),
+        # so a full SCAN+DELETE of auth:perms:* is acceptable.
+        permission_mutators = {
+            "set_permission_for_role", "remove_permission_from_role",
+            "assign_user_to_role", "remove_user_from_role",
+            "add_project_user_role", "delete_project_user_role",
+            "update_project_user_roles", "add_project_role_permission",
+            "delete_project_role_permission", "apply_project_roles_snapshot",
+        }
+        for proxy_name in permission_mutators:
+            if hasattr(self, proxy_name):
+                setattr(
+                    self, proxy_name,
+                    self._wrap_perms_invalidation(getattr(self, proxy_name)),
+                )
         #
         self.has_access = has_access  # pylint: disable=W0201
         # Register auth tool
@@ -955,14 +1115,18 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         #     mode, auth_data.__dict__, project_id,
         # )
 
+        if auth_data.type == "user":
+            kind, resolver = "user", self.get_user_permissions
+        elif auth_data.type == "token":
+            kind, resolver = "token", self.get_token_permissions
+        else:
+            # Public: no permissions
+            return set()
+
         try:
-            if auth_data.type == "user":  # pylint: disable=R1705
-                return self.get_user_permissions(auth_data.id, mode=mode, project_id=project_id)
-            elif auth_data.type == "token":
-                return self.get_token_permissions(auth_data.id, mode=mode, project_id=project_id)
-            else:
-                # Public: no permissions
-                return set()
+            return self._resolve_permissions_cached(
+                kind, resolver, auth_data.id, mode, project_id
+            )
         except:  # pylint: disable=W0702
             log.exception("Failed to get permissions")
             return set()
