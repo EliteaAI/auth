@@ -264,11 +264,17 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         # future miss for that key re-creates a fresh lock — harmless.
         self._perms_singleflight_locks = cachetools.LRUCache(maxsize=4096)
         self._perms_lock_acquire_timeout = 2.0  # seconds; fall back to own fetch if exceeded
-        # Use gevent-aware semaphore when running under gevent, standard
-        # threading semaphore otherwise (gunicorn, pytest, etc.). Both expose
-        # the same acquire(timeout=) / release() interface.
+        # Use gevent-aware semaphore only when gevent is actually monkey-patched
+        # and running (not merely installed). Under gunicorn threaded workers or
+        # in tests, gevent may be importable but not active — using gevent locks
+        # in that context would deadlock. Both semaphore types expose the same
+        # acquire(timeout=) / release() interface.
         try:
-            from gevent.lock import BoundedSemaphore as _BoundedSemaphore  # pylint: disable=C0415,E0401
+            from gevent import monkey as _monkey  # pylint: disable=C0415,E0401
+            if _monkey.is_module_patched("threading"):
+                from gevent.lock import BoundedSemaphore as _BoundedSemaphore  # pylint: disable=C0415,E0401
+            else:
+                from threading import BoundedSemaphore as _BoundedSemaphore  # pylint: disable=C0415
         except ImportError:
             from threading import BoundedSemaphore as _BoundedSemaphore  # pylint: disable=C0415
         self._perms_lock_guard = _BoundedSemaphore(1)  # serializes per-key lock creation
@@ -380,7 +386,11 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         lock = self._perms_singleflight_locks.get(cache_key)
         if lock is None:
             try:
-                from gevent.lock import BoundedSemaphore  # pylint: disable=C0415,E0401
+                from gevent import monkey as _monkey  # pylint: disable=C0415,E0401
+                if _monkey.is_module_patched("threading"):
+                    from gevent.lock import BoundedSemaphore  # pylint: disable=C0415,E0401
+                else:
+                    from threading import BoundedSemaphore  # pylint: disable=C0415
             except ImportError:
                 from threading import BoundedSemaphore  # pylint: disable=C0415
             with self._perms_lock_guard:
