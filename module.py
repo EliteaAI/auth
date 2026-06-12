@@ -264,7 +264,13 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         # future miss for that key re-creates a fresh lock — harmless.
         self._perms_singleflight_locks = cachetools.LRUCache(maxsize=4096)
         self._perms_lock_acquire_timeout = 2.0  # seconds; fall back to own fetch if exceeded
-        from gevent.lock import BoundedSemaphore as _BoundedSemaphore  # pylint: disable=C0415,E0401
+        # Use gevent-aware semaphore when running under gevent, standard
+        # threading semaphore otherwise (gunicorn, pytest, etc.). Both expose
+        # the same acquire(timeout=) / release() interface.
+        try:
+            from gevent.lock import BoundedSemaphore as _BoundedSemaphore  # pylint: disable=C0415,E0401
+        except ImportError:
+            from threading import BoundedSemaphore as _BoundedSemaphore  # pylint: disable=C0415
         self._perms_lock_guard = _BoundedSemaphore(1)  # serializes per-key lock creation
 
     #
@@ -373,7 +379,10 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         """
         lock = self._perms_singleflight_locks.get(cache_key)
         if lock is None:
-            from gevent.lock import BoundedSemaphore  # pylint: disable=C0415,E0401
+            try:
+                from gevent.lock import BoundedSemaphore  # pylint: disable=C0415,E0401
+            except ImportError:
+                from threading import BoundedSemaphore  # pylint: disable=C0415
             with self._perms_lock_guard:
                 lock = self._perms_singleflight_locks.get(cache_key)
                 if lock is None:
