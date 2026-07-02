@@ -859,10 +859,7 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
                 if not isinstance(context, Holder):
                     return func(*_args, **_kvargs)
                 #
-                try:
-                    mode = flask.g.theme.active_mode
-                except AttributeError:
-                    mode = c.DEFAULT_MODE
+                mode = c.DEFAULT_MODE
 
                 current_permissions = self.resolve_permissions(
                     mode=mode, auth_data=context.auth
@@ -1053,33 +1050,6 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
             auth_data.reference = "-"
         #
         return auth_data
-
-    #
-    # Tools: slot
-    #
-
-    def make_request_state(self):
-        """ Make request state snapshot for slots """
-        state = Holder()
-        #
-        state.auth = flask.g.auth
-        #
-        state.request = Holder()
-        state.request.args = dict(flask.request.args)
-        #
-        state.theme = Holder()
-        try:
-            state.theme.active_mode = flask.g.theme.active_mode
-            state.theme.active_parameter = flask.g.theme.active_parameter
-            state.theme.active_section = flask.g.theme.active_section
-            state.theme.active_subsection = flask.g.theme.active_subsection
-        except AttributeError:
-            state.theme.active_mode = c.DEFAULT_MODE
-            state.theme.active_parameter = None
-            state.theme.active_section = None
-            state.theme.active_subsection = None
-        #
-        return state
 
     #
     # Tools: user in project
