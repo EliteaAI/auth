@@ -254,6 +254,7 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         self.get_user_cache = cachetools.TTLCache(maxsize=20480, ttl=60)
         self.get_token_cache = cachetools.TTLCache(maxsize=20480, ttl=60)
         self.get_project_permissions_cache = cachetools.TTLCache(maxsize=20480, ttl=60)  # Direct project permissions cache
+        self.project_suspended_cache = cachetools.TTLCache(maxsize=8192, ttl=30)
         # Redis cache for auth_authorize (under load optimization)
         self._redis_client = None
         self._auth_cache_ttl = 60  # seconds
@@ -447,6 +448,10 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
             self.get_token = cachetools.cached(  # pylint: disable=W0201
                 cache=self.get_token_cache
             )(self.get_token)
+            #
+            self.is_project_suspended = cachetools.cached(  # pylint: disable=W0201
+                cache=self.project_suspended_cache
+            )(self.is_project_suspended)
         # Load GeoIP databases
         try:
             self.geoip = pygeoip.GeoIP("/usr/share/GeoIP/GeoIP.dat")  # pylint: disable=W0201
@@ -829,6 +834,14 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
                 # log.info('CHECK API %s', _kwargs)
                 # log.info('CHECK API %s %s', mode, project_id)
 
+                if project_id is not None and mode != "administration" \
+                        and self.is_project_suspended(project_id):
+                    if add_verbose_info and isinstance(access_denied_reply, dict):
+                        access_denied_reply['mode'] = mode
+                        access_denied_reply['project_id'] = project_id
+                        access_denied_reply['reason'] = 'project_suspended'
+                    return access_denied_reply, 403
+
                 current_permissions = self.resolve_permissions(
                     mode=mode,
                     project_id=project_id
@@ -1055,9 +1068,22 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
     # Tools: user in project
     #
 
+    def is_project_suspended(self, project_id):
+        """ Check if project is suspended """
+        if not project_id:
+            return False
+        try:
+            project = self.context.rpc_manager.call.project_get_by_id(project_id)
+        except:  # pylint: disable=W0702
+            return False
+        return bool(project and project.get("suspended"))
+
     def is_user_in_project(self, project_id):
         """ Check if user in specific project """
         if not project_id:
+            return False
+        #
+        if self.is_project_suspended(project_id):
             return False
         #
         current_user = self.current_user()
@@ -1074,6 +1100,9 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
             return False
         #
         if not project_id:
+            return False
+        #
+        if self.is_project_suspended(project_id):
             return False
         #
         current_user = self.current_user(
