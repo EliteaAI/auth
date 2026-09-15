@@ -209,6 +209,7 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
             ["list_tokens", "auth_list_tokens"],
             ["encode_token", "auth_encode_token"],
             ["decode_token", "auth_decode_token"],
+            ["ensure_system_token", "auth_ensure_system_token"],
             #
             ["get_token_permissions", "auth_get_token_permissions"],
             #
