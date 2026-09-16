@@ -5,6 +5,8 @@ from pylon.core.tools import log
 
 from tools import auth
 
+from ...constants import SYSTEM_TOKEN_NAME
+
 try:
     from tools import api_tools
 except:  # pylint: disable=W0702
@@ -37,6 +39,12 @@ class API(api_tools.APIBase):
             except RuntimeError:
                 return {'error': f'token with uid {uid} not found'}, 400
             #
+            if token_data['user_id'] != user['id']:
+                return None, 403
+            #
+            if token_data['name'] == SYSTEM_TOKEN_NAME:
+                return {'error': f'token with uid {uid} not found'}, 404
+            #
             token_data['token'] = f"...{str(auth.encode_token(token_data['id']))[-7:]}"
             #
             return jsonify(token_data)
@@ -65,6 +73,11 @@ class API(api_tools.APIBase):
             name = request.json['name']
         except KeyError:
             return {'error': 'Name is required'}, 400
+
+        # Matched exactly: the name is the only thing that marks a system
+        # token, so letting a user claim it would let them forge one.
+        if name == SYSTEM_TOKEN_NAME:
+            return {'error': f'Name "{SYSTEM_TOKEN_NAME}" is reserved'}, 400
 
         expires = request.json.get('expires')
         if expires:
@@ -103,6 +116,9 @@ class API(api_tools.APIBase):
             return {'error': f'token with uid {uid} not found'}, 400
         if token_data['user_id'] != user['id']:
             return None, 403
+
+        if token_data['name'] == SYSTEM_TOKEN_NAME:
+            return {'error': 'system token cannot be deleted'}, 403
 
         auth.delete_token(token_id=token_data['id'])
         return None, 204
