@@ -29,3 +29,17 @@ def test_registration_adds_only_the_exact_string(auth_module):
 def test_prefix_generators_are_gone(auth_module):
     assert not hasattr(auth_module, "generate_permissions_from_string")
     assert not hasattr(auth_module, "generate_permissions")
+
+
+def test_registration_never_generates_developer_rows(auth_module):
+    fake = _fake_module()
+
+    auth_module.Module._create_template_permissions(fake, {
+        "permissions": ["some.perm"],
+        "recommended_roles": {
+            "administration": {"admin": True},
+            "developer": {"admin": True, "viewer": True},
+        },
+    })
+
+    assert {row[1] for row in fake.inserted} == {"administration", "default"}
