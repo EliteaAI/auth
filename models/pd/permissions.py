@@ -15,7 +15,6 @@ class DefaultModeRoles(ModeRoles):
 
 class RecommendedRoles(BaseModel):
     administration: ModeRoles = ModeRoles()
-    developer: ModeRoles = ModeRoles()
     default: DefaultModeRoles = DefaultModeRoles()
 
 
