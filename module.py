@@ -47,50 +47,6 @@ except:  # pylint: disable=W0702
     cfg = None
 
 
-def generate_permissions(permission_dict: dict[str, str]) -> set[str]:
-    """ Prepare permission set """
-    # actions = {'edit', 'create', 'delete', 'view'}
-    actions = set()
-    if user_action := permission_dict.pop('action', None):
-        actions.add(user_action)
-    result = set()
-    parent = ""
-    for scope_name, scope in permission_dict.items():
-        if not scope:
-            break
-        parent += scope
-        if scope_name == 'item':
-            for action in actions:
-                result.add(parent + '.' + action)
-        else:
-            result.add(parent)
-        parent += '.'
-
-    return result
-
-
-def generate_permissions_from_string(permission_string: str) -> set[str]:
-    """
-    Generate permissions from string.
-
-    :param permission_string: String with permissions.
-
-    :return: generated list of permissions.
-    """
-    permission_dict = {
-        'section': None,
-        'subsection': None,
-        'item': None,
-        'action': None
-    }
-    permissions = permission_string.split('.')
-
-    for permission_part, permission in zip(permissions, permission_dict.keys()):
-        permission_dict[permission] = permission_part
-
-    return generate_permissions(permission_dict)
-
-
 def has_access(user_permissions: set, required_permissions: list | dict) -> bool:
     """ Check access """
     if isinstance(required_permissions, dict):
@@ -218,6 +174,7 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
             ["set_permission_for_role", "auth_set_permission_for_role"],
             ["remove_permission_from_role", "auth_remove_permission_from_role"],
             ["insert_permissions", "auth_insert_permissions"],
+            ["delete_permissions_everywhere", "auth_delete_permissions_everywhere"],
             ["get_user_roles", "auth_get_user_roles"],
             ["add_role", "auth_add_role"],
             ["delete_role", "auth_delete_role"],
@@ -754,7 +711,6 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
                 for role, value in roles.items():
                     if value:
                         result.append((role, mode, perm))
-            self.local_permissions.update(generate_permissions_from_string(perm))
             self.local_permissions.add(perm)
 
         if result:
