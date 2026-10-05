@@ -1,6 +1,6 @@
 {
   "name": "Auth tools",
-  "version": "0.32",
+  "version": "0.33",
   "init_after": [
     "shared",
     "auth_core"
