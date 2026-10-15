@@ -227,6 +227,10 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         self.epoch_stale_max_s = 60.0
         self._epoch_cache = {}  # (kind, id) -> (valid_until, result, read_at)
         self._epoch_clock = time.monotonic
+        # Permission registration during boot retries while pylon_auth is still coming
+        # up; past the deadline the module fails as before. Config "permissions_rpc_deadline_s".
+        self.permissions_rpc_deadline_s = 60.0
+        self.permissions_retry_sleep_s = 1.0
         self.counters = {
             "auth_epoch_mismatch_total": 0,
             "auth_invalidate_events_total": 0,
@@ -544,6 +548,9 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         )
         self.epoch_stale_max_s = float(
             self.descriptor.config.get("epoch_stale_max_s", self.epoch_stale_max_s)
+        )
+        self.permissions_rpc_deadline_s = float(
+            self.descriptor.config.get("permissions_rpc_deadline_s", self.permissions_rpc_deadline_s)
         )
         # Add decorators
         self.decorators.check = self._decorator_check
@@ -924,7 +931,31 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
             self.local_permissions.add(perm)
 
         if result:
-            self.insert_permissions(result)
+            self._insert_permissions_bounded(result)
+
+    def _insert_permissions_bounded(self, rows):
+        """ Register permission rows in auth_core, retrying while pylon_auth is still booting
+
+        An RPC request published before auth_core has registered its handler is lost and
+        surfaces as queue.Empty after the proxy timeout. One such loss during module init
+        used to fail this module and every module depending on it. Retry until the
+        deadline, then re-raise: permissions must be registered, so the failure stays loud.
+        """
+        deadline = time.monotonic() + self.permissions_rpc_deadline_s
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return self.insert_permissions(rows)
+            except Exception:  # pylint: disable=W0703
+                if time.monotonic() >= deadline:
+                    log.error("Permission registration failed after %s attempt(s); giving up", attempt)
+                    raise
+                log.warning(
+                    "Permission registration attempt %s failed (pylon_auth not ready?); retrying",
+                    attempt,
+                )
+                time.sleep(self.permissions_retry_sleep_s)
 
     #
     # Decorators

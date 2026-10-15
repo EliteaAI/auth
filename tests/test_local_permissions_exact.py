@@ -7,14 +7,18 @@ left over from when has_access matched by prefix; those rows grant nothing.
 import types
 
 
-def _fake_module():
-    fake = types.SimpleNamespace(local_permissions=set(), inserted=[])
+def _fake_module(auth_module):
+    fake = types.SimpleNamespace(
+        local_permissions=set(), inserted=[],
+        permissions_rpc_deadline_s=30, permissions_retry_sleep_s=0,
+    )
     fake.insert_permissions = fake.inserted.extend
+    fake._insert_permissions_bounded = lambda rows: auth_module.Module._insert_permissions_bounded(fake, rows)
     return fake
 
 
 def test_registration_adds_only_the_exact_string(auth_module):
-    fake = _fake_module()
+    fake = _fake_module(auth_module)
 
     auth_module.Module._create_template_permissions(fake, {
         "permissions": ["configuration.evaluation.platform_dimensions.view"],
@@ -32,7 +36,7 @@ def test_prefix_generators_are_gone(auth_module):
 
 
 def test_registration_never_generates_developer_rows(auth_module):
-    fake = _fake_module()
+    fake = _fake_module(auth_module)
 
     auth_module.Module._create_template_permissions(fake, {
         "permissions": ["some.perm"],
