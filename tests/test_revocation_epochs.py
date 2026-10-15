@@ -234,7 +234,7 @@ def test_invalidate_event_evicts_without_waiting_for_the_ttl(auth, world, clock)
     get_user(1)
 
     assert len(calls) == 2  # no clock advance: the event dropped the epoch read
-    assert auth.counters["auth_invalidate_events_total"] == 1
+    assert auth.counters["auth_invalidate_events_total"].total() == 1
 
 
 def test_invalidate_of_a_user_also_drops_the_epoch_reads_of_their_tokens(auth, world):
@@ -263,7 +263,7 @@ def test_malformed_invalidate_payloads_are_ignored(auth):
     auth._on_auth_invalidate(None, "auth_invalidate", None)
     auth._on_auth_invalidate(None, "auth_invalidate", {"kind": "user"})
 
-    assert auth.counters["auth_invalidate_events_total"] == 0
+    assert auth.counters["auth_invalidate_events_total"].total() == 0
 
 
 # --- Redis auth-result cache ----------------------------------------------------
@@ -280,7 +280,7 @@ def test_cached_auth_is_stamped_with_the_epochs_and_served_while_current(auth):
     auth._set_cached_auth("k", authorized())
 
     assert auth._get_cached_auth("k")["headers"]["X-Auth-ID"] == "1"
-    assert auth.counters["auth_epoch_mismatch_total"] == 0
+    assert auth.counters["auth_epoch_mismatch_total"].total() == 0
 
 
 def test_cached_auth_with_an_older_epoch_is_a_miss_and_is_dropped(auth, world, clock):
@@ -291,7 +291,7 @@ def test_cached_auth_with_an_older_epoch_is_a_miss_and_is_dropped(auth, world, c
 
     assert auth._get_cached_auth("k") is None
     assert "k" not in auth.redis.data
-    assert auth.counters["auth_epoch_mismatch_total"] == 1
+    assert auth.counters["auth_epoch_mismatch_total"].total() == 1
 
 
 def test_cached_auth_without_epochs_is_not_trusted(auth):
@@ -456,3 +456,50 @@ def test_a_recent_read_survives_an_auth_outage_within_epoch_stale_max(auth, worl
 def test_no_prior_read_fails_closed_during_an_outage(auth, world):
     world.down = True
     assert auth._read_epochs("token", 10) is None
+
+
+# --- security metrics (#6754): shared tool when loaded, local fallback otherwise ----
+
+
+class SharedMetrics:
+    def __init__(self):
+        self.incs = {}
+
+    def counter(self, name, description, labels=()):
+        incs = self.incs.setdefault(name, [])
+        return types.SimpleNamespace(
+            inc=lambda value=1, **labels: incs.append((value, labels)),
+            total=lambda **labels: sum(v for v, _ in incs))
+
+
+def mismatch_then_invalidate(auth, world, clock):
+    auth._set_cached_auth("k", authorized())
+    world.bump_user(1)
+    clock.now += 5.1
+    auth._get_cached_auth("k")
+    auth._on_auth_invalidate(None, "auth_invalidate", {"kind": "user", "id": 1, "epoch": 1})
+
+
+def test_counters_use_the_shared_tool_when_it_is_loaded(auth, world, clock, monkeypatch):
+    import sys
+    shared = SharedMetrics()
+    monkeypatch.setitem(sys.modules, "tools", types.SimpleNamespace(security_metrics=shared))
+
+    mismatch_then_invalidate(auth, world, clock)
+
+    assert shared.incs == {"auth_epoch_mismatch_total": [(1, {})], "auth_invalidate_events_total": [(1, {})]}
+    assert auth.counters["auth_epoch_mismatch_total"].total() == 1
+
+
+def test_counters_fall_back_to_a_local_total_and_the_structured_log_line(auth, world, clock, monkeypatch):
+    import sys
+    lines = []
+    monkeypatch.setitem(sys.modules, "tools", types.ModuleType("tools"))
+    monkeypatch.setitem(sys.modules, "pylon.core.tools",
+                        types.SimpleNamespace(log=types.SimpleNamespace(info=lambda msg, *a: lines.append(msg))))
+
+    mismatch_then_invalidate(auth, world, clock)
+
+    assert lines == ["security_metric name=auth_epoch_mismatch_total value=1",
+                     "security_metric name=auth_invalidate_events_total value=1"]
+    assert auth.counters["auth_invalidate_events_total"].total() == 1

@@ -36,6 +36,7 @@ from pylon.core.tools import module  # pylint: disable=E0611,E0401
 from pylon.core.tools.context import Context as Holder  # pylint: disable=E0611,E0401
 
 from .models.pd.permissions import Permissions
+from .security_metrics_client import SecurityCounter
 
 try:
     from tools import constants as c  # pylint: disable=E0401
@@ -232,8 +233,11 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         self.permissions_rpc_deadline_s = 60.0
         self.permissions_retry_sleep_s = 1.0
         self.counters = {
-            "auth_epoch_mismatch_total": 0,
-            "auth_invalidate_events_total": 0,
+            "auth_epoch_mismatch_total": SecurityCounter(
+                "auth_epoch_mismatch_total",
+                "Cached auth results rejected because the identity's epoch moved on"),
+            "auth_invalidate_events_total": SecurityCounter(
+                "auth_invalidate_events_total", "auth_invalidate events handled by this process"),
         }
         # Redis cache for auth_authorize (under load optimization)
         self._redis_client = None
@@ -452,7 +456,7 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
             return False
         #
         if stored.get("user") != current.get("user") or stored.get("token") != current.get("token"):
-            self.counters["auth_epoch_mismatch_total"] += 1
+            self.counters["auth_epoch_mismatch_total"].inc()
             return False
         #
         return True
@@ -500,7 +504,7 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         except (TypeError, KeyError):
             return
         #
-        self.counters["auth_invalidate_events_total"] += 1
+        self.counters["auth_invalidate_events_total"].inc()
         self._invalidate_local(kind, id_)
 
     def _invalidate_local(self, kind, id_):
