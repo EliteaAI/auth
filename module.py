@@ -166,6 +166,10 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
             ["encode_token", "auth_encode_token"],
             ["decode_token", "auth_decode_token"],
             ["ensure_system_token", "auth_ensure_system_token"],
+            ["set_token_expiry", "auth_set_token_expiry"],
+            #
+            ["get_revocation_epochs", "auth_get_revocation_epochs"],
+            ["bump_revocation_epoch", "auth_bump_revocation_epoch"],
             #
             ["get_token_permissions", "auth_get_token_permissions"],
             #
@@ -213,6 +217,20 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         self.get_token_cache = cachetools.TTLCache(maxsize=20480, ttl=60)
         self.get_project_permissions_cache = cachetools.TTLCache(maxsize=20480, ttl=60)  # Direct project permissions cache
         self.project_suspended_cache = cachetools.TTLCache(maxsize=8192, ttl=30)
+        # Revocation epochs (C-1009, #6944): cached entries are keyed with the
+        # epoch they were built under; the epoch itself is re-read every epoch_ttl
+        # seconds, which is the bound on how stale a revoked identity can be.
+        self.epoch_ttl = 5.0  # seconds, config key "epoch_ttl"
+        self.epoch_rpc_timeout = 5  # seconds, config key "epoch_rpc_timeout"
+        # When pylon_auth cannot be reached, the last read stays usable for this long
+        # (the old cache bound); beyond it admission fails closed. Config "epoch_stale_max_s".
+        self.epoch_stale_max_s = 60.0
+        self._epoch_cache = {}  # (kind, id) -> (valid_until, result, read_at)
+        self._epoch_clock = time.monotonic
+        self.counters = {
+            "auth_epoch_mismatch_total": 0,
+            "auth_invalidate_events_total": 0,
+        }
         # Redis cache for auth_authorize (under load optimization)
         self._redis_client = None
         self._auth_cache_ttl = 60  # seconds
@@ -311,7 +329,7 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         return f"auth:session:{key_hash}"
 
     def _get_cached_auth(self, cache_key: str) -> Optional[dict]:
-        """ Get auth result from Redis cache """
+        """ Get auth result from Redis cache, unless the identity was revoked since """
         redis_client = self.get_cache_redis_client()
         if not redis_client:
             return None
@@ -319,21 +337,181 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
             cached = redis_client.get(cache_key)
             if cached:
                 log.debug(f"[AUTH_CACHE] Cache HIT: {cache_key[:20]}...")
-                return json.loads(cached)
+                auth_status = json.loads(cached)
+                if self._cached_auth_is_current(auth_status):
+                    return auth_status
+                # Revoked, or built without epochs: the caller re-authorizes
+                self._drop_cached_auth(cache_key)
         except Exception as e:
             log.error(f"[AUTH_CACHE] Redis get failed: {e}")
         return None
 
     def _set_cached_auth(self, cache_key: str, auth_status: dict) -> None:
-        """ Store auth result in Redis cache """
+        """ Store auth result in Redis cache, stamped with the epochs it was valid under """
         redis_client = self.get_cache_redis_client()
         if not redis_client:
             return
         try:
+            identity = self._auth_status_identity(auth_status)
+            if identity is not None:
+                epochs = self._read_epochs(*identity)
+                # Not provably active right now: do not cache, authorize next time
+                if epochs is None or not epochs.get("active"):
+                    return
+                auth_status = dict(
+                    auth_status,
+                    epochs={"user": epochs.get("user"), "token": epochs.get("token")},
+                )
             redis_client.setex(cache_key, self._auth_cache_ttl, json.dumps(auth_status))
             log.debug(f"[AUTH_CACHE] Cache SET: {cache_key[:20]}... (TTL={self._auth_cache_ttl}s)")
         except Exception as e:
             log.error(f"[AUTH_CACHE] Redis set failed: {e}")
+
+    def _drop_cached_auth(self, cache_key: Optional[str]) -> None:
+        """ Forget one cached auth result """
+        redis_client = self.get_cache_redis_client() if cache_key else None
+        if not redis_client:
+            return
+        try:
+            redis_client.delete(cache_key)
+        except Exception as e:
+            log.error(f"[AUTH_CACHE] Redis delete failed: {e}")
+
+    #
+    # Revocation epochs
+    #
+
+    @staticmethod
+    def _auth_status_identity(auth_status: dict):
+        """ (type, id) of an authenticated user/token in an auth_authorize result, else None """
+        headers = auth_status.get("headers") or {}
+        auth_type = headers.get("X-Auth-Type", "public")
+        if auth_type not in ("user", "token"):
+            return None
+        try:
+            return auth_type, int(headers.get("X-Auth-ID"))
+        except (TypeError, ValueError):
+            return None
+
+    def _read_epochs(self, auth_type, auth_id) -> Optional[dict]:
+        """ Current epochs and admission verdict of a user/token, cached for epoch_ttl
+
+        None when they cannot be read: callers treat that as "not provably
+        active" (fail closed). Failures are not cached.
+        """
+        if auth_type not in ("user", "token") or not isinstance(auth_id, int):
+            return None
+        #
+        key = (auth_type, auth_id)
+        now = self._epoch_clock()
+        hit = self._epoch_cache.get(key)
+        if hit is not None and hit[0] > now:
+            return hit[1]
+        #
+        try:
+            value = self.context.rpc_manager.timeout(self.epoch_rpc_timeout).auth_get_revocation_epochs(
+                **{f"{auth_type}_id": auth_id}
+            )
+        except:  # pylint: disable=W0702
+            log.exception("Failed to read revocation epochs: %s %s", auth_type, auth_id)
+            # Bounded staleness: a read younger than epoch_stale_max_s still counts
+            # (D5 parameter); older, or none at all, fails closed
+            if hit is not None and now - hit[2] <= self.epoch_stale_max_s:
+                return hit[1]
+            self._epoch_cache.pop(key, None)
+            return None
+        #
+        if len(self._epoch_cache) >= 20480:
+            for old_key, (valid_until, _, _) in list(self._epoch_cache.items()):
+                if valid_until <= now:
+                    self._epoch_cache.pop(old_key, None)
+            if len(self._epoch_cache) >= 20480:
+                self._epoch_cache.clear()
+        #
+        self._epoch_cache[key] = (now + self.epoch_ttl, value, now)
+        return value
+
+    def _identity_active(self, auth_type, auth_id) -> bool:
+        """ May this session/token be admitted right now? """
+        epochs = self._read_epochs(auth_type, auth_id)
+        return bool(epochs and epochs.get("active"))
+
+    def _cached_auth_is_current(self, auth_status: dict) -> bool:
+        """ Was this cached auth result built under the epochs that are current now? """
+        identity = self._auth_status_identity(auth_status)
+        if identity is None:
+            return True
+        #
+        stored = auth_status.get("epochs")
+        current = self._read_epochs(*identity)
+        if not stored or current is None:
+            return False
+        #
+        if stored.get("user") != current.get("user") or stored.get("token") != current.get("token"):
+            self.counters["auth_epoch_mismatch_total"] += 1
+            return False
+        #
+        return True
+
+    def _epoch_cached(self, func, cache, kind, id_name):
+        """ cachetools.cached replacement whose key carries the identity's epoch
+
+        A newer epoch means a different key, so an entry built before a
+        revocation can no longer be hit; it ages out (or is evicted by the
+        auth_invalidate event). If the epoch cannot be read the cache is
+        bypassed. Calls without an integer id (lookups by email/uuid) have no
+        epoch and keep the plain TTL behaviour.
+        """
+        @functools.wraps(func)
+        def _wrapper(*args, **kwargs):
+            ident = args[0] if args else kwargs.get(id_name)
+            stamp = None
+            if isinstance(ident, int):
+                epochs = self._read_epochs(kind, ident)
+                if epochs is None:
+                    return func(*args, **kwargs)
+                stamp = (epochs.get("user"),) if kind == "user" \
+                    else (epochs.get("token"), epochs.get("user"))
+            else:
+                ident = None
+            key = (ident, stamp, args, tuple(sorted(kwargs.items())))
+            try:
+                return cache[key]
+            except KeyError:
+                pass
+            value = func(*args, **kwargs)
+            try:
+                cache[key] = value
+            except ValueError:  # does not fit
+                pass
+            return value
+        #
+        return _wrapper
+
+    def _on_auth_invalidate(self, context, event, payload):
+        """ auth_invalidate: forget what this process knows about one user/token now """
+        _ = context, event
+        try:
+            kind, id_ = payload["kind"], payload["id"]
+        except (TypeError, KeyError):
+            return
+        #
+        self.counters["auth_invalidate_events_total"] += 1
+        self._invalidate_local(kind, id_)
+
+    def _invalidate_local(self, kind, id_):
+        """ Drop the epoch reads and cached entries of one user/token """
+        for key, (_, value, _) in list(self._epoch_cache.items()):
+            owner_match = kind == "user" and key[0] == "token" and (value or {}).get("user_id") == id_
+            if key == (kind, id_) or owner_match:
+                self._epoch_cache.pop(key, None)
+        #
+        caches = (self.get_user_cache, self.get_user_permissions_cache) if kind == "user" \
+            else (self.get_token_cache, self.get_token_permissions_cache)
+        for cache in caches:
+            for key in list(cache):
+                if key[0] == id_:
+                    cache.pop(key, None)
 
     #
     # Module
@@ -360,6 +538,13 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         log.info("Initializing module")
         # Config
         self.auth_mode = self.descriptor.config.get("auth_mode", self.auth_mode).lower()
+        self.epoch_ttl = float(self.descriptor.config.get("epoch_ttl", self.epoch_ttl))
+        self.epoch_rpc_timeout = self.descriptor.config.get(
+            "epoch_rpc_timeout", self.epoch_rpc_timeout
+        )
+        self.epoch_stale_max_s = float(
+            self.descriptor.config.get("epoch_stale_max_s", self.epoch_stale_max_s)
+        )
         # Add decorators
         self.decorators.check = self._decorator_check
         self.decorators.check_api = self._decorator_check_api
@@ -390,26 +575,31 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         self.register_permissions = self._reg_permissions  # pylint: disable=W0201
         # Enable cache
         if self.descriptor.config.get("enable_cache", True):
-            # FIXME: maybe this creates malfunctions
-            self.get_user_permissions = cachetools.cached(  # pylint: disable=W0201
-                cache=self.get_user_permissions_cache
-            )(self.get_user_permissions)
+            # Entries are keyed with the revocation epoch, see _epoch_cached
+            self.get_user_permissions = self._epoch_cached(  # pylint: disable=W0201
+                self.get_user_permissions, self.get_user_permissions_cache, "user", "user_id",
+            )
             #
-            self.get_token_permissions = cachetools.cached(  # pylint: disable=W0201
-                cache=self.get_token_permissions_cache
-            )(self.get_token_permissions)
+            self.get_token_permissions = self._epoch_cached(  # pylint: disable=W0201
+                self.get_token_permissions, self.get_token_permissions_cache, "token", "token_id",
+            )
             #
-            self.get_user = cachetools.cached(  # pylint: disable=W0201
-                cache=self.get_user_cache
-            )(self.get_user)
+            self.get_user = self._epoch_cached(  # pylint: disable=W0201
+                self.get_user, self.get_user_cache, "user", "user_id",
+            )
             #
-            self.get_token = cachetools.cached(  # pylint: disable=W0201
-                cache=self.get_token_cache
-            )(self.get_token)
+            self.get_token = self._epoch_cached(  # pylint: disable=W0201
+                self.get_token, self.get_token_cache, "token", "token_id",
+            )
             #
             self.is_project_suspended = cachetools.cached(  # pylint: disable=W0201
                 cache=self.project_suspended_cache
             )(self.is_project_suspended)
+        # Revocations announced by auth_core evict local state at once; the epoch
+        # read above is the guarantee, this is only the accelerator
+        self.context.event_manager.register_listener(
+            "auth_invalidate", self._on_auth_invalidate,
+        )
         # Load GeoIP databases
         try:
             self.geoip = pygeoip.GeoIP("/usr/share/GeoIP/GeoIP.dat")  # pylint: disable=W0201
@@ -458,6 +648,9 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
     def deinit(self):
         """ De-init module """
         log.info("De-initializing module")
+        self.context.event_manager.unregister_listener(
+            "auth_invalidate", self._on_auth_invalidate,
+        )
         # Unregister auth tool
         self.descriptor.unregister_tool("auth")
         # Unregister RPC proxies
@@ -498,6 +691,8 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
                 return flask.redirect(flask.request.url.replace("http://", "https://", 1))
         #
         flask.g.auth = Holder()
+        cache_key = None
+        is_public_route = False
         #
         if self.auth_mode == "rpc":
             # Collect data
@@ -578,6 +773,21 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
             flask.g.auth.id = int(flask.g.auth.id)
         except:  # pylint: disable=W0702
             flask.g.auth.id = "-"
+        #
+        # Admission: a session or token is only as good as its owner's current
+        # state - exists, not suspended, token not expired. The Redis cache and
+        # the headers of traefik mode can both outlive a revocation, so this is
+        # checked against the (epoch_ttl-cached) auth_core verdict on every request.
+        if flask.g.auth.type in ("user", "token") and isinstance(flask.g.auth.id, int) \
+                and not self._identity_active(flask.g.auth.type, flask.g.auth.id):
+            log.info(
+                "Admission refused: %s %s is revoked, suspended or expired",
+                flask.g.auth.type, flask.g.auth.id,
+            )
+            self._drop_cached_auth(cache_key)
+            if self.auth_mode == "rpc" and not is_public_route:
+                return self.access_denied_reply()
+            self._make_public_g_auth()
         #
         flask.g.visitor = Holder()
         #
@@ -923,6 +1133,11 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         # )
 
         try:
+            # Long-lived auth data (SIO connections) must not outlive a revocation
+            if auth_data.type in ("user", "token") and isinstance(auth_data.id, int) \
+                    and not self._identity_active(auth_data.type, auth_data.id):
+                return set()
+            #
             if auth_data.type == "user":  # pylint: disable=R1705
                 return self.get_user_permissions(auth_data.id, mode=mode, project_id=project_id)
             elif auth_data.type == "token":
