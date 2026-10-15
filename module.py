@@ -222,7 +222,10 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         # seconds, which is the bound on how stale a revoked identity can be.
         self.epoch_ttl = 5.0  # seconds, config key "epoch_ttl"
         self.epoch_rpc_timeout = 5  # seconds, config key "epoch_rpc_timeout"
-        self._epoch_cache = {}  # (kind, id) -> (valid_until, auth_get_revocation_epochs result)
+        # When pylon_auth cannot be reached, the last read stays usable for this long
+        # (the old cache bound); beyond it admission fails closed. Config "epoch_stale_max_s".
+        self.epoch_stale_max_s = 60.0
+        self._epoch_cache = {}  # (kind, id) -> (valid_until, result, read_at)
         self._epoch_clock = time.monotonic
         self.counters = {
             "auth_epoch_mismatch_total": 0,
@@ -411,17 +414,21 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
             )
         except:  # pylint: disable=W0702
             log.exception("Failed to read revocation epochs: %s %s", auth_type, auth_id)
+            # Bounded staleness: a read younger than epoch_stale_max_s still counts
+            # (D5 parameter); older, or none at all, fails closed
+            if hit is not None and now - hit[2] <= self.epoch_stale_max_s:
+                return hit[1]
             self._epoch_cache.pop(key, None)
             return None
         #
         if len(self._epoch_cache) >= 20480:
-            for old_key, (valid_until, _) in list(self._epoch_cache.items()):
+            for old_key, (valid_until, _, _) in list(self._epoch_cache.items()):
                 if valid_until <= now:
                     self._epoch_cache.pop(old_key, None)
             if len(self._epoch_cache) >= 20480:
                 self._epoch_cache.clear()
         #
-        self._epoch_cache[key] = (now + self.epoch_ttl, value)
+        self._epoch_cache[key] = (now + self.epoch_ttl, value, now)
         return value
 
     def _identity_active(self, auth_type, auth_id) -> bool:
@@ -494,7 +501,7 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
 
     def _invalidate_local(self, kind, id_):
         """ Drop the epoch reads and cached entries of one user/token """
-        for key, (_, value) in list(self._epoch_cache.items()):
+        for key, (_, value, _) in list(self._epoch_cache.items()):
             owner_match = kind == "user" and key[0] == "token" and (value or {}).get("user_id") == id_
             if key == (kind, id_) or owner_match:
                 self._epoch_cache.pop(key, None)
@@ -534,6 +541,9 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         self.epoch_ttl = float(self.descriptor.config.get("epoch_ttl", self.epoch_ttl))
         self.epoch_rpc_timeout = self.descriptor.config.get(
             "epoch_rpc_timeout", self.epoch_rpc_timeout
+        )
+        self.epoch_stale_max_s = float(
+            self.descriptor.config.get("epoch_stale_max_s", self.epoch_stale_max_s)
         )
         # Add decorators
         self.decorators.check = self._decorator_check

@@ -315,11 +315,14 @@ def test_public_results_are_cached_as_before(auth):
     assert auth._get_cached_auth("k") is not None
 
 
-def test_cached_auth_is_refused_when_epochs_cannot_be_read(auth, world, clock):
+def test_cached_auth_is_served_from_a_recent_read_and_refused_beyond_the_stale_bound(auth, world, clock):
     auth._set_cached_auth("k", authorized())
     world.down = True
-    clock.now += 5.1
+    clock.now += 5.1  # past epoch_ttl, inside epoch_stale_max_s: the last read still vouches
 
+    assert auth._get_cached_auth("k") is not None
+
+    clock.now += 60  # beyond the stale bound: nothing vouches, refused
     assert auth._get_cached_auth("k") is None
 
 
@@ -431,3 +434,25 @@ def test_permissions_are_empty_for_a_revoked_identity(auth, world, clock, monkey
     clock.now += 5.1
 
     assert auth.resolve_permissions(auth_data=who) == set()
+
+
+def test_a_recent_read_survives_an_auth_outage_within_epoch_stale_max(auth, world, clock):
+    assert auth.epoch_stale_max_s == 60.0
+    assert auth._identity_active("user", 1)  # one real read at t=1000
+
+    world.down = True
+    clock.now += 30  # past epoch_ttl, inside the stale bound: last read still counts
+    assert auth._identity_active("user", 1)
+    assert len(world.calls) == 2  # the retry was attempted, then the stale read served
+
+    clock.now += 31  # 61 s after the read: beyond the bound, fail closed
+    assert auth._read_epochs("user", 1) is None
+    assert not auth._identity_active("user", 1)
+
+    world.down = False
+    assert auth._identity_active("user", 1)  # recovers on the next successful read
+
+
+def test_no_prior_read_fails_closed_during_an_outage(auth, world):
+    world.down = True
+    assert auth._read_epochs("token", 10) is None
