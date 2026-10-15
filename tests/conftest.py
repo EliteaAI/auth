@@ -10,6 +10,14 @@ PLUGIN_ROOT = pathlib.Path(__file__).resolve().parent.parent
 PACKAGE = "auth_plugin_under_test"
 
 
+class _TTLCacheStub(dict):
+    """cachetools.TTLCache without the clock: tests drive expiry themselves."""
+
+    def __init__(self, maxsize, ttl):
+        super().__init__()
+        self.maxsize, self.ttl = maxsize, ttl
+
+
 def _stub(name, **attrs):
     module = types.ModuleType(name)
     module.__dict__.update(attrs)
@@ -25,7 +33,7 @@ def auth_module():
     stubs = {
         "flask": _stub("flask", request=None, make_response=None),
         "redis": _stub("redis"),
-        "cachetools": _stub("cachetools"),
+        "cachetools": _stub("cachetools", TTLCache=_TTLCacheStub),
         "pygeoip": _stub("pygeoip"),
         "pylon": _stub("pylon"),
         "pylon.core": _stub("pylon.core"),
