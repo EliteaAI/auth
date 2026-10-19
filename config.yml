@@ -1,2 +1,16 @@
 # Register API endpoints (pylon_main serves admin APIs)
 register_api: true
+# Identity verification (C-1009, #6756). Absent => no identity kind that needs
+# settings is admitted. tenant_id must be a tenant GUID (not common/organizations/consumers).
+# identity_verifier:
+#   session_user:
+#     tenant_id: <guid>
+#     audience: api://elitea-api-test
+#     jwks_uri: https://login.microsoftonline.com/<guid>/discovery/v2.0/keys
+#     leeway_s: 60            # 0-300
+#     jwks_lifespan_s: 3600
+#     algorithms: [RS256]
+#   workload:
+#     issuer: <iss>
+#     jwks_uri: <https uri>
+#     audiences: {governed_ops: elitea:governed-ops}
