@@ -5,6 +5,9 @@ VerifiedPrincipal or a TypedRejection. Nothing here is consulted unless the
 operator configures the "identity_verifier" section; with the section absent
 every kind that needs configuration is "not admitted" and PyJWT is never imported.
 
+Session-user "issuer" overrides the Entra global-cloud issuer (national clouds, local-dev mock);
+"insecure_dev_http" allows http only for localhost, *.localhost and 127.0.0.1.
+
 Rejection messages are fixed text per code. They never carry tokens, cookies,
 auth references or claim values, and neither do the log lines written here.
 """
@@ -12,10 +15,10 @@ auth references or claim values, and neither do the log lines written here.
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any, Literal, Mapping, Optional, Protocol, Union
+from typing import Any, ClassVar, Literal, Mapping, Optional, Protocol, Union
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator, model_validator
 
 from pylon.core.tools import log  # pylint: disable=E0611,E0401
 
@@ -48,6 +51,23 @@ _ASYMMETRIC_ALGORITHMS = Literal[
 ]
 
 
+_DEV_HOSTS = ("localhost", "127.0.0.1")
+
+
+def _check_url(value: str, field: str, insecure_dev_http: bool) -> str:
+    """ https URL; http is accepted only for local-dev hosts and only when insecure_dev_http is set """
+    parsed = urlparse(value)
+    if not parsed.hostname or value != value.strip():
+        raise ValueError(f"{field} must be an https URL")
+    if parsed.scheme == "https":
+        return value
+    host = parsed.hostname.lower()
+    dev_host = host in _DEV_HOSTS or host.endswith(".localhost")
+    if parsed.scheme == "http" and insecure_dev_http and dev_host:
+        return value
+    raise ValueError(f"{field} must be an https URL (http only for localhost/*.localhost with insecure_dev_http)")
+
+
 def rejection(code: str) -> TypedRejection:
     """ The rejection for a code, with its fixed message """
     return TypedRejection(reason_code=code, message=MESSAGES[code])
@@ -68,19 +88,28 @@ class _TokenSettings(_Settings):
     jwks_lifespan_s: StrictInt = Field(default=3600, ge=1)
     algorithms: tuple[_ASYMMETRIC_ALGORITHMS, ...] = Field(default=("RS256",), min_length=1)
 
-    @field_validator("jwks_uri")
-    @classmethod
-    def _https(cls, value):
-        parsed = urlparse(value)
-        if parsed.scheme != "https" or not parsed.hostname or value != value.strip():
-            raise ValueError("jwks_uri must be an https URL")
-        return value
+    insecure_dev_http: StrictBool = False
+    _url_fields: ClassVar[tuple[str, ...]] = ("jwks_uri",)
+
+    @model_validator(mode="after")
+    def _urls(self):
+        for field in self._url_fields:
+            value = getattr(self, field)
+            if value is not None:
+                _check_url(value, field, self.insecure_dev_http)
+        return self
 
 
 class SessionUserSettings(_TokenSettings):
     """ Entra ID delegated tokens of user sessions """
     tenant_id: str
     audience: str = Field(min_length=1)
+    issuer: Optional[str] = None
+    _url_fields: ClassVar[tuple[str, ...]] = ("jwks_uri", "issuer")
+
+    @property
+    def effective_issuer(self) -> str:
+        return self.issuer or f"https://login.microsoftonline.com/{self.tenant_id}/v2.0"
 
     @field_validator("tenant_id")
     @classmethod
@@ -275,7 +304,7 @@ class IdentityVerifier:
         claims = self._decode(
             "session_user", token, cfg,
             audience=cfg.audience,
-            issuer=f"https://login.microsoftonline.com/{cfg.tenant_id}/v2.0",
+            issuer=cfg.effective_issuer,
             require=["exp", "nbf", "iss", "aud", "tid", "oid"],
         )
         if claims["tid"] != cfg.tenant_id:
