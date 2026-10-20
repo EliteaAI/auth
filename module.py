@@ -35,7 +35,11 @@ from pylon.core.tools import log  # pylint: disable=E0611,E0401
 from pylon.core.tools import module  # pylint: disable=E0611,E0401
 from pylon.core.tools.context import Context as Holder  # pylint: disable=E0611,E0401
 
+from pydantic import ValidationError  # pylint: disable=E0401
+
+from .models.pd.identity import EVIDENCE_ADAPTER
 from .models.pd.permissions import Permissions
+from .utils.identity_verifier import IdentityVerifier, load_verifier_settings, rejection
 
 try:
     from tools import constants as c  # pylint: disable=E0401
@@ -118,6 +122,7 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
             ["update_user", "auth_update_user"],
             ["delete_user", "auth_delete_user"],
             ["get_user", "auth_get_user"],
+            ["get_user_by_idp_subject", "auth_get_user_by_idp_subject"],
             ["list_users", "auth_list_users"],
             ["list_users_paginated", "auth_list_users_paginated"],
             #
@@ -435,6 +440,27 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         self._epoch_cache[key] = (now + self.epoch_ttl, value, now)
         return value
 
+    def read_identity_epochs(self, auth_type, auth_id) -> Optional[dict]:
+        """ Epochs and admission verdict of a user/token (None: cannot be read) """
+        return self._read_epochs(auth_type, auth_id)
+
+    def verify_identity(self, evidence: dict, *, admitted_kinds) -> dict:
+        """ Verify identity evidence given as a dict (callers cannot import our types)
+
+        Returns {"ok": True, "principal": {...}} or {"ok": False, "reason_code", "message"}
+        """
+        try:
+            parsed = EVIDENCE_ADAPTER.validate_python(evidence)
+        except ValidationError:
+            # The error text would echo the input, which may hold a token: drop it
+            result = rejection("IDENTITY_EVIDENCE_MISSING")
+        else:
+            result = self.identity_verifier.verify(parsed, admitted_kinds=frozenset(admitted_kinds or ()))
+        #
+        if hasattr(result, "reason_code"):
+            return {"ok": False, "reason_code": result.reason_code, "message": result.message}
+        return {"ok": True, "principal": result.model_dump(mode="json")}
+
     def _identity_active(self, auth_type, auth_id) -> bool:
         """ May this session/token be admitted right now? """
         epochs = self._read_epochs(auth_type, auth_id)
@@ -551,6 +577,12 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         )
         self.permissions_rpc_deadline_s = float(
             self.descriptor.config.get("permissions_rpc_deadline_s", self.permissions_rpc_deadline_s)
+        )
+        # Identity verification (C-1009, #6756): nothing is configured unless the
+        # "identity_verifier" section is present
+        self.identity_verifier = IdentityVerifier(  # pylint: disable=W0201
+            load_verifier_settings(self.descriptor.config.get("identity_verifier")),
+            auth_module=self,
         )
         # Add decorators
         self.decorators.check = self._decorator_check
