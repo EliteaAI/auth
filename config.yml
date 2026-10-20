@@ -7,6 +7,8 @@ register_api: true
 #     tenant_id: <guid>
 #     audience: api://elitea-api-test
 #     jwks_uri: https://login.microsoftonline.com/<guid>/discovery/v2.0/keys
+#     issuer: https://login.microsoftonline.us/<guid>/v2.0   # optional: national clouds or the local-dev mock issuer
+#     insecure_dev_http: false   # local-dev only: allow http for localhost/*.localhost jwks_uri and issuer
 #     leeway_s: 60            # 0-300
 #     jwks_lifespan_s: 3600
 #     algorithms: [RS256]

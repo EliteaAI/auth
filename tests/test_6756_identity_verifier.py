@@ -520,10 +520,48 @@ def test_non_guid_tenants_are_refused(mods, tenant):
     {"algorithms": ["none"]},
     {"algorithms": []},
     {"unknown_key": 1},
+    {"issuer": "http://mock.example.test/elitea"},
+    {"issuer": "https://"},
+    {"jwks_uri": "http://localhost:8081/elitea/jwks"},
+    {"insecure_dev_http": True, "jwks_uri": "http://mock.example.test/jwks"},
+    {"insecure_dev_http": "yes"},
 ])
 def test_bad_session_user_settings_are_refused(mods, override):
     with pytest.raises(ValueError):
         mods.verifier.load_verifier_settings(settings_with(**override))
+
+
+def test_dev_http_is_accepted_only_for_local_hosts_with_the_flag(mods, auth):
+    dev_issuer = "http://127.0.0.1:8081/elitea"
+    loaded = mods.verifier.load_verifier_settings(settings_with(
+        insecure_dev_http=True, jwks_uri="http://mock-oidc.localhost:8081/elitea/jwks", issuer=dev_issuer,
+    )).session_user
+
+    assert loaded.insecure_dev_http is True
+    assert loaded.effective_issuer == dev_issuer
+    # http JWKS with the flag builds a real key source
+    verifier = mods.verifier.IdentityVerifier(
+        mods.verifier.load_verifier_settings(settings_with(
+            insecure_dev_http=True, jwks_uri="http://mock-oidc.localhost:8081/elitea/jwks", issuer=dev_issuer,
+        )),
+        auth_module=auth,
+    )
+    assert verifier.configured("session_user")
+    #
+    default = mods.verifier.load_verifier_settings(settings_with()).session_user
+    assert default.insecure_dev_http is False
+    assert default.effective_issuer == ISSUER
+
+
+def test_issuer_override_is_enforced_on_the_token(mods, auth, build):
+    override = "https://idp.example.test/elitea"
+    verifier = build({"session_user": dict(SETTINGS["session_user"], issuer=override)})
+
+    auth.set_token(sign(session_claims(iss=override)))
+    assert_verified(verify_session(mods, verifier))
+
+    auth.set_token(sign(session_claims(iss=ISSUER)))
+    assert_rejected(verify_session(mods, verifier), "IDENTITY_TENANT_MISMATCH")
 
 
 @pytest.mark.parametrize("workload", [
