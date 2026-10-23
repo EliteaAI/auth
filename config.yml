@@ -12,6 +12,16 @@ register_api: true
 #     leeway_s: 60            # 0-300
 #     jwks_lifespan_s: 3600
 #     algorithms: [RS256]
+#     # Which claims carry the tenant and the subject (defaults: Entra tid/oid). A generic
+#     # OIDC issuer such as Keycloak has no tenant claim: set tid to null, name the subject
+#     # claim, and keep tenant_id as the operator-assigned GUID of that realm (the same value
+#     # auth_oidc's subject_tenant uses). Keycloak omits nbf: switch require_nbf off.
+#     subject_claims: {tid: tid, oid: oid}
+#     require_nbf: true
+#     # Which stored token is verified: access_token (default; Entra, aud = this API app) or
+#     # id_token (aud is always the client id: for issuers whose access tokens carry no
+#     # audience for this platform without extra mappers, e.g. Keycloak).
+#     delegation_token: access_token
 #   workload:
 #     issuer: <iss>
 #     jwks_uri: <https uri>
