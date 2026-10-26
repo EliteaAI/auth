@@ -106,6 +106,8 @@ def test_a_registered_bearer_is_decided_by_its_verifier_and_runs_as_its_user(aut
     ({"ok": True, "user_id": True}, 401, "INTERNAL_TOKEN_INVALID"),
     (None, 401, "INTERNAL_TOKEN_INVALID"),
     (RuntimeError("boom"), 401, "INTERNAL_TOKEN_INVALID"),
+    ({"ok": False, "status": 503, "code": "DEPENDENCY_UNAVAILABLE", "message": "try again"}, 503, "DEPENDENCY_UNAVAILABLE"),
+    ({"ok": False, "status": 500, "code": "X", "message": "m"}, 401, "X"),
 ])
 def test_a_refused_or_failing_verification_refuses_the_request_without_a_fallback(auth, hook, core, reply, status, code):
     auth.register_bearer_verifier("eio1.", verifier([], reply))
@@ -135,9 +137,13 @@ def test_without_a_registered_verifier_nothing_changes(auth, hook, core):
     assert core.authorize_calls == 1
 
 
-def test_a_prefix_must_be_specific_and_can_be_removed(auth):
+@pytest.mark.parametrize("prefix", ["e", "eio1", "eyJ", "Bearer ", "eio1.x", "EIO1.", ""])
+def test_a_prefix_must_be_a_type_marker(auth, prefix):
     with pytest.raises(ValueError):
-        auth.register_bearer_verifier("e", lambda token, environ: None)
+        auth.register_bearer_verifier(prefix, lambda token, environ: None)
+
+
+def test_a_prefix_can_be_removed(auth):
     auth.register_bearer_verifier("eio1.", lambda token, environ: None)
     auth.unregister_bearer_verifier("eio1.")
     assert auth.bearer_verifiers == {}

@@ -878,11 +878,13 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         """ A plugin verifies the bearers that start with ``prefix`` itself (C-1009 #7214)
 
         ``verifier(token, environ)`` returns ``{"ok": True, "user_id": int}`` or
-        ``{"ok": False, "status": 401|403, "code", "message"}``. Such a bearer never
+        ``{"ok": False, "status": 401|403|503, "code", "message"}``. Such a bearer never
         reaches auth_core: a refusal or a failure of the verifier refuses the request.
+        The prefix is a token type marker: lower-case letters and digits, then a dot
+        (``eio1.``), so it can never be the start of a JWT or an auth_core token.
         """
-        if not isinstance(prefix, str) or len(prefix) < 4 or not callable(verifier):
-            raise ValueError("a bearer verifier needs a prefix of at least 4 characters and a callable")
+        if not isinstance(prefix, str) or not re.fullmatch(r"[a-z][a-z0-9]{1,7}\.", prefix) or not callable(verifier):
+            raise ValueError("a bearer verifier needs a type prefix like 'eio1.' and a callable")
         self.bearer_verifiers[prefix] = verifier
 
     def unregister_bearer_verifier(self, prefix):
@@ -918,7 +920,7 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
             result = None
         if not isinstance(result, dict):
             result = {"status": 401, "code": "INTERNAL_TOKEN_INVALID", "message": "The request could not be verified."}
-        status = result.get("status") if result.get("status") in (401, 403) else 401
+        status = result.get("status") if result.get("status") in (401, 403, 503) else 401
         self._make_public_g_auth()
         return flask.make_response(
             {"error": result.get("code") or "INTERNAL_TOKEN_INVALID",
