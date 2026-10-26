@@ -216,6 +216,8 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         #
         self.auth_mode = "traefik"
         self.public_rules = []  # [rule]
+        # Bearers another plugin issues and verifies itself (C-1009 #7214: the run token of a governed run), by prefix
+        self.bearer_verifiers = {}  # prefix -> verifier(token, environ) -> dict
         # Caches
         self.get_user_permissions_cache = cachetools.TTLCache(maxsize=20480, ttl=60)
         self.get_token_permissions_cache = cachetools.TTLCache(maxsize=20480, ttl=60)
@@ -737,7 +739,14 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         cache_key = None
         is_public_route = False
         #
-        if self.auth_mode == "rpc":
+        registered = self._registered_bearer() if self.bearer_verifiers else None
+        if registered is not None:
+            # a bearer a plugin issued: only that plugin's verifier decides, never auth_core (fail closed)
+            refusal = self._apply_registered_bearer(*registered)
+            if refusal is not None:
+                return refusal
+        #
+        elif self.auth_mode == "rpc":
             # Collect data
             source_uri = flask.request.full_path
             if not flask.request.query_string and source_uri.endswith("?"):
@@ -864,6 +873,56 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         log.debug("Visitor: %s", visitor_event)
         #
         return None
+
+    def register_bearer_verifier(self, prefix, verifier):
+        """ A plugin verifies the bearers that start with ``prefix`` itself (C-1009 #7214)
+
+        ``verifier(token, environ)`` returns ``{"ok": True, "user_id": int}`` or
+        ``{"ok": False, "status": 401|403, "code", "message"}``. Such a bearer never
+        reaches auth_core: a refusal or a failure of the verifier refuses the request.
+        """
+        if not isinstance(prefix, str) or len(prefix) < 4 or not callable(verifier):
+            raise ValueError("a bearer verifier needs a prefix of at least 4 characters and a callable")
+        self.bearer_verifiers[prefix] = verifier
+
+    def unregister_bearer_verifier(self, prefix):
+        """ Stop verifying bearers with ``prefix`` (they are then refused by auth_core as unknown) """
+        self.bearer_verifiers.pop(prefix, None)
+
+    def _registered_bearer(self):
+        """ (verifier, token) when the request's bearer has a registered prefix, else None """
+        header = flask.request.headers.get("Authorization", "")
+        scheme, _, token = header.partition(" ")
+        if scheme.lower() != "bearer":
+            return None
+        token = token.strip()
+        for prefix, verifier in list(self.bearer_verifiers.items()):
+            if token.startswith(prefix):
+                return verifier, token
+        return None
+
+    def _apply_registered_bearer(self, verifier, token):
+        """ Set flask.g.auth from the verifier's verdict; the refusal response, or None """
+        try:
+            result = verifier(token, flask.request.environ)
+        except:  # pylint: disable=W0702
+            log.error("A bearer verifier failed; the request is refused")
+            result = None
+        if isinstance(result, dict) and result.get("ok") is True:
+            user_id = result.get("user_id")
+            if isinstance(user_id, int) and not isinstance(user_id, bool) and user_id > 0:
+                flask.g.auth.type = "user"
+                flask.g.auth.id = user_id
+                flask.g.auth.reference = "-"
+                return None
+            result = None
+        if not isinstance(result, dict):
+            result = {"status": 401, "code": "INTERNAL_TOKEN_INVALID", "message": "The request could not be verified."}
+        status = result.get("status") if result.get("status") in (401, 403) else 401
+        self._make_public_g_auth()
+        return flask.make_response(
+            {"error": result.get("code") or "INTERNAL_TOKEN_INVALID",
+             "message": result.get("message") or "The request could not be verified."}, status)
 
     @staticmethod
     def _make_public_g_auth():
