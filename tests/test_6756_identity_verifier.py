@@ -553,6 +553,130 @@ def test_dev_http_is_accepted_only_for_local_hosts_with_the_flag(mods, auth):
     assert default.effective_issuer == ISSUER
 
 
+# --- session_user: subject claims of a generic issuer (Keycloak) ---------------
+
+
+KEYCLOAK_ISSUER = "https://keycloak.example.test/realms/elitea"
+KEYCLOAK_SETTINGS = dict(
+    SETTINGS["session_user"], issuer=KEYCLOAK_ISSUER, audience="account",
+    jwks_uri="https://keycloak.example.test/realms/elitea/protocol/openid-connect/certs",
+    subject_claims={"tid": None, "oid": "sub"}, require_nbf=False,
+)
+
+
+def keycloak_claims(**overrides):
+    """ A Keycloak access token: sub, no tid/oid, no nbf """
+    claims = {"iss": KEYCLOAK_ISSUER, "aud": "account", "sub": OID, "exp": NOW + 300, "iat": NOW, "jti": "jti-1"}
+    claims.update(overrides)
+    return {k: v for k, v in claims.items() if v is not None}
+
+
+def test_the_default_subject_claims_are_todays_entra_contract(mods):
+    cfg = mods.verifier.load_verifier_settings(settings_with()).session_user
+
+    assert cfg.required_claims == ["exp", "nbf", "iss", "aud", "tid", "oid"]
+    assert (cfg.subject_claims.tid, cfg.subject_claims.oid, cfg.require_nbf) == ("tid", "oid", True)
+
+
+def test_a_keycloak_shaped_token_is_verified_by_sub_under_the_configured_tenant(mods, auth, build):
+    verifier = build({"session_user": KEYCLOAK_SETTINGS})
+    auth.set_token(sign(keycloak_claims()))
+
+    principal = verify_session(mods, verifier)
+
+    assert_verified(principal)
+    evidence = principal.evidence
+    assert (evidence.issuer, evidence.tid, evidence.oid, evidence.delegation_ref) == (KEYCLOAK_ISSUER, TENANT, OID, "jti-1")
+    assert auth.called("get_user_by_idp_subject")[0][1] == (KEYCLOAK_ISSUER, TENANT, OID)
+    assert verifier.settings.session_user.required_claims == ["exp", "iss", "aud", "sub"]
+
+
+@pytest.mark.parametrize("overrides, code", [
+    ({"iss": "https://keycloak.example.test/realms/other"}, "IDENTITY_TENANT_MISMATCH"),
+    ({"aud": "another"}, "IDENTITY_AUDIENCE_MISMATCH"),
+    ({"aud": None}, "IDENTITY_AUDIENCE_MISMATCH"),
+    ({"sub": None}, "IDENTITY_SUBJECT_UNLINKED"),
+    ({"exp": NOW - 3600}, "IDENTITY_EXPIRED"),
+], ids=["issuer", "audience", "no audience", "no subject", "expired"])
+def test_a_tenant_less_configuration_still_pins_issuer_audience_subject_and_time(mods, auth, build, overrides, code):
+    verifier = build({"session_user": KEYCLOAK_SETTINGS})
+    auth.set_token(sign(keycloak_claims(**overrides)))
+
+    assert_rejected(verify_session(mods, verifier), code)
+
+
+def test_a_tenant_less_configuration_still_requires_the_link_and_the_session_identity(mods, auth, build):
+    verifier = build({"session_user": KEYCLOAK_SETTINGS})
+    auth.set_token(sign(keycloak_claims()))
+
+    auth.linked = {"id": USER_ID + 1}
+    assert_rejected(verify_session(mods, verifier), "IDENTITY_SUBJECT_UNLINKED")
+
+    auth.linked = {"id": USER_ID}
+    auth.context["provider_attr"]["identity"] = {"tid": TENANT, "oid": "someone-else"}
+    assert_rejected(verify_session(mods, verifier), "IDENTITY_SUBJECT_UNLINKED")
+
+
+def test_a_renamed_tenant_claim_is_required_and_compared(mods, auth, build):
+    verifier = build({"session_user": dict(KEYCLOAK_SETTINGS, subject_claims={"tid": "realm", "oid": "sub"})})
+
+    auth.set_token(sign(keycloak_claims(realm=TENANT)))
+    assert_verified(verify_session(mods, verifier))
+
+    auth.set_token(sign(keycloak_claims(realm="99999999-2222-3333-4444-555555555555")))
+    assert_rejected(verify_session(mods, verifier), "IDENTITY_TENANT_MISMATCH")
+
+    auth.set_token(sign(keycloak_claims()))
+    assert_rejected(verify_session(mods, verifier), "IDENTITY_TENANT_MISMATCH")
+
+
+def test_nbf_stays_required_by_default_and_is_checked_when_present_without_the_flag(mods, auth, build):
+    verifier = build({"session_user": KEYCLOAK_SETTINGS})
+
+    auth.set_token(sign(keycloak_claims(nbf=NOW + 3600)))
+    assert_rejected(verify_session(mods, verifier), "IDENTITY_EXPIRED")
+
+    auth.set_token(sign(keycloak_claims(nbf=NOW - 10)))
+    assert_verified(verify_session(mods, verifier))
+
+
+def test_the_default_verifies_the_access_token_and_id_token_is_opt_in(mods, auth, build):
+    assert mods.verifier.load_verifier_settings(settings_with()).session_user.delegation_token == "access_token"
+    verifier = build({"session_user": dict(KEYCLOAK_SETTINGS, audience="client-1", delegation_token="id_token")})
+    auth.context["provider_attr"]["delegation"] = {
+        "access_token": sign(keycloak_claims(aud=None)), "id_token": sign(keycloak_claims(aud="client-1")),
+    }
+
+    principal = verify_session(mods, verifier)
+
+    assert_verified(principal)
+    assert principal.evidence.audience == "client-1"
+
+
+def test_the_configured_token_is_the_only_one_read(mods, auth, build):
+    verifier = build({"session_user": dict(KEYCLOAK_SETTINGS, audience="client-1", delegation_token="id_token")})
+    auth.context["provider_attr"]["delegation"] = {"access_token": sign(keycloak_claims(aud="client-1"))}
+
+    assert_rejected(verify_session(mods, verifier), "IDENTITY_EVIDENCE_MISSING")
+
+
+@pytest.mark.parametrize("override", [
+    {"delegation_token": "refresh_token"},
+    {"delegation_token": ""},
+    {"subject_claims": {"oid": ""}},
+    {"subject_claims": {"oid": None}},
+    {"subject_claims": {"oid": " sub"}},
+    {"subject_claims": {"tid": ""}},
+    {"subject_claims": {"tid": 5}},
+    {"subject_claims": {"subject": "sub"}},
+    {"subject_claims": "sub"},
+    {"require_nbf": "no"},
+], ids=lambda o: str(o))
+def test_bad_subject_claim_settings_are_refused(mods, override):
+    with pytest.raises(ValueError):
+        mods.verifier.load_verifier_settings(settings_with(**override))
+
+
 def test_issuer_override_is_enforced_on_the_token(mods, auth, build):
     override = "https://idp.example.test/elitea"
     verifier = build({"session_user": dict(SETTINGS["session_user"], issuer=override)})

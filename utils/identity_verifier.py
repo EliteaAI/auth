@@ -8,6 +8,14 @@ every kind that needs configuration is "not admitted" and PyJWT is never importe
 Session-user "issuer" overrides the Entra global-cloud issuer (national clouds, local-dev mock);
 "insecure_dev_http" allows http only for localhost, *.localhost and 127.0.0.1.
 
+Session-user "subject_claims" names the token claims that carry the tenant and the
+subject (Entra: tid/oid, the default). A null tid claim means the tenant is the
+configured tenant_id and only the issuer pins the realm (Keycloak: oid from "sub").
+"require_nbf" is on by default; issuers that omit nbf (Keycloak) switch it off.
+"delegation_token" picks the stored token that is verified: the access token (default,
+Entra: aud is the API app) or the ID token (aud is always the client id, for issuers whose
+access tokens carry no audience for this platform).
+
 Rejection messages are fixed text per code. They never carry tokens, cookies,
 auth references or claim values, and neither do the log lines written here.
 """
@@ -100,16 +108,56 @@ class _TokenSettings(_Settings):
         return self
 
 
+def _claim_name(value, field):
+    """ A claim name: a non-empty string without surrounding whitespace """
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError(f"{field} must be a claim name")
+    return value
+
+
+class SubjectClaims(_Settings):
+    """ Which token claims carry the tenant and the subject of a user
+
+    tid: the tenant claim, compared with tenant_id; null means the tenant is tenant_id by
+    configuration and no tenant claim is required (the issuer alone pins the realm).
+    oid: the subject claim, linked to the user as (issuer, tenant, subject).
+    """
+    tid: Optional[str] = "tid"
+    oid: str = "oid"
+
+    @field_validator("tid")
+    @classmethod
+    def _tid(cls, value):
+        return None if value is None else _claim_name(value, "subject_claims.tid")
+
+    @field_validator("oid")
+    @classmethod
+    def _oid(cls, value):
+        return _claim_name(value, "subject_claims.oid")
+
+
 class SessionUserSettings(_TokenSettings):
-    """ Entra ID delegated tokens of user sessions """
+    """ Delegated tokens of user sessions (Entra ID by default; any OIDC issuer through subject_claims) """
     tenant_id: str
     audience: str = Field(min_length=1)
     issuer: Optional[str] = None
+    subject_claims: SubjectClaims = Field(default_factory=SubjectClaims)
+    require_nbf: StrictBool = True
+    delegation_token: Literal["access_token", "id_token"] = "access_token"
     _url_fields: ClassVar[tuple[str, ...]] = ("jwks_uri", "issuer")
 
     @property
     def effective_issuer(self) -> str:
         return self.issuer or f"https://login.microsoftonline.com/{self.tenant_id}/v2.0"
+
+    @property
+    def required_claims(self) -> list:
+        """ The claims a token must carry; ["exp", "nbf", "iss", "aud", "tid", "oid"] by default """
+        subject = self.subject_claims
+        return (
+            ["exp"] + (["nbf"] if self.require_nbf else []) + ["iss", "aud"]
+            + ([subject.tid] if subject.tid else []) + [subject.oid]
+        )
 
     @field_validator("tenant_id")
     @classmethod
@@ -294,23 +342,27 @@ class IdentityVerifier:
         provider_attr = context.get("provider_attr") if isinstance(context, dict) else None
         provider_attr = provider_attr if isinstance(provider_attr, dict) else {}
         delegation = provider_attr.get("delegation")
-        token = delegation.get("access_token") if isinstance(delegation, dict) else None
+        token = delegation.get(cfg.delegation_token) if isinstance(delegation, dict) else None
         if not isinstance(token, str) or not token:
             raise _Reject("IDENTITY_EVIDENCE_MISSING")
         # The session must belong to the user the evidence names
         if context.get("user_id") != evidence.user_id:
             raise _Reject("IDENTITY_SUBJECT_UNLINKED")
         #
+        subject = cfg.subject_claims
         claims = self._decode(
             "session_user", token, cfg,
             audience=cfg.audience,
             issuer=cfg.effective_issuer,
-            require=["exp", "nbf", "iss", "aud", "tid", "oid"],
+            require=cfg.required_claims,
+            missing_codes={subject.tid: "IDENTITY_TENANT_MISMATCH"} if subject.tid else None,
         )
-        if claims["tid"] != cfg.tenant_id:
+        # Without a tenant claim the tenant is the configured one: the issuer check above pinned the realm
+        tid = claims[subject.tid] if subject.tid else cfg.tenant_id
+        if tid != cfg.tenant_id:
             raise _Reject("IDENTITY_TENANT_MISMATCH")
         #
-        tid, oid = claims["tid"], claims["oid"]
+        oid = claims[subject.oid]
         if not isinstance(oid, str) or not oid:
             raise _Reject("IDENTITY_SUBJECT_UNLINKED")
         linked = self._rpc("get_user_by_idp_subject", claims["iss"], tid, oid)
@@ -384,10 +436,13 @@ class IdentityVerifier:
             raise _Reject("IDENTITY_REVOKED")
         return epochs
 
-    def _decode(self, kind, token, cfg, *, audience, issuer, require) -> dict:  # pylint: disable=R0912
+    def _decode(  # pylint: disable=R0912,R0913
+            self, kind, token, cfg, *, audience, issuer, require, missing_codes=None,
+    ) -> dict:
         """ Signature, algorithm, issuer, audience, required claims and time window """
         import jwt  # pylint: disable=C0415
         #
+        claim_codes = {**_MISSING_CLAIM_CODES, **(missing_codes or {})}
         try:
             algorithm = jwt.get_unverified_header(token).get("alg")
         except jwt.PyJWTError:
@@ -417,7 +472,7 @@ class IdentityVerifier:
         except jwt.InvalidIssuerError:
             raise _Reject("IDENTITY_TENANT_MISMATCH") from None
         except jwt.MissingRequiredClaimError as exc:
-            raise _Reject(_MISSING_CLAIM_CODES.get(exc.claim, "IDENTITY_SUBJECT_UNLINKED")) from None
+            raise _Reject(claim_codes.get(exc.claim, "IDENTITY_SUBJECT_UNLINKED")) from None
         except jwt.PyJWTError:
             raise _Reject("IDENTITY_SIGNATURE_INVALID") from None
         #
