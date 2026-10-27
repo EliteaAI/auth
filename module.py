@@ -1317,18 +1317,25 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
             #
             # Cache miss - call RPC
             if auth_status is None:
-                try:
-                    auth_status = self.context.rpc_manager.timeout(15).auth_authorize(
-                        source, headers, cookies
-                    )
-                    # Cache successful auth results
-                    if cache_key and auth_status.get("auth_ok"):
-                        self._set_cached_auth(cache_key, auth_status)
-                except:  # pylint: disable=W0702
+                # A socket is authenticated once, at handshake, and the result is kept for its whole
+                # life. One failed call (auth service restarting, network flapping) would leave a valid
+                # user anonymous until the page is refreshed, so the call gets a second chance first.
+                for attempt in (1, 2):
+                    try:
+                        auth_status = self.context.rpc_manager.timeout(15).auth_authorize(
+                            source, headers, cookies
+                        )
+                        # Cache successful auth results
+                        if cache_key and auth_status.get("auth_ok"):
+                            self._set_cached_auth(cache_key, auth_status)
+                        break
+                    except:  # pylint: disable=W0702
+                        auth_status = None
+                        log.warning("SIO handshake authorize failed (attempt %s of 2)", attempt)
+                if auth_status is None:
                     auth_data.type = "public"
                     auth_data.id = "-"
                     auth_data.reference = "-"
-                    auth_status = None  # Mark as handled
             #
             if auth_status is not None:
                 if auth_status["auth_ok"]:
