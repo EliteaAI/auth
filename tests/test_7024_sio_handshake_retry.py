@@ -32,13 +32,24 @@ def _authorized(user_id="42"):
     }
 
 
+class _Slow:
+    """An authorize call that waits ``seconds`` of the handshake's time and then fails (or answers)."""
+
+    def __init__(self, seconds, result=None):
+        self.seconds = seconds
+        self.result = result
+
+
 class _Handshake:
-    """The parts of the plugin ``sio_make_auth_data`` touches, with a scripted authorize RPC."""
+    """The parts of the plugin ``sio_make_auth_data`` touches, with a scripted authorize RPC and a clock."""
 
     def __init__(self, outcomes, cached=None):
         self.auth_mode = "rpc"
+        self.sio_authorize_budget_s = 20.0
         self.sio_authorize_retry_delay_s = 0.5
         self.sio_authorize_retry_timeout_s = 3
+        self.now = 0.0
+        self._sio_authorize_clock = lambda: self.now
         self.outcomes = list(outcomes)
         self.calls = 0
         self.cached = cached
@@ -54,6 +65,11 @@ class _Handshake:
     def _authorize(self, *_args):
         self.calls += 1
         outcome = self.outcomes.pop(0)
+        if isinstance(outcome, _Slow):
+            self.now += outcome.seconds
+            if outcome.result is None:
+                raise queue.Empty()
+            return outcome.result
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
@@ -74,6 +90,17 @@ def pauses(auth_module, monkeypatch):
     recorded = []
     monkeypatch.setattr(auth_module.time, "sleep", recorded.append)
     return recorded
+
+
+def _advance_on_sleep(handshake, pauses):
+    """A pause also uses up handshake time, like a real sleep."""
+    original = pauses.append
+
+    def sleep(seconds):
+        handshake.now += seconds
+        original(seconds)
+
+    return sleep
 
 
 @pytest.fixture
@@ -135,22 +162,57 @@ def test_a_refusal_is_an_answer_and_is_not_retried(make_auth_data):
     assert handshake.calls == 1
 
 
-def test_the_second_attempt_is_shorter_so_the_handshake_stays_inside_the_client_limit(make_auth_data):
-    handshake = _Handshake([queue.Empty(), _authorized()])
+def test_a_quick_failure_leaves_room_for_a_normal_retry(make_auth_data):
+    handshake = _Handshake([_Slow(0.2), _authorized()])
 
     make_auth_data(handshake)
 
-    # The first call keeps its 15 s. The client gives up after 20 s, so the retry cannot be another 15 s.
+    # 20 s budget - 0.2 s used - 0.5 s pause = 19.3 s left; halved is 9.65 s, capped at the configured 3 s
     assert handshake.timeouts == [15, 3]
 
 
-def test_the_worst_case_stays_below_the_client_connect_limit(make_auth_data, pauses):
-    handshake = _Handshake([queue.Empty(), queue.Empty()])
+def test_the_retry_timeout_shrinks_with_the_time_the_first_attempt_used(make_auth_data):
+    handshake = _Handshake([_Slow(15), _authorized()])
 
     make_auth_data(handshake)
 
-    worst_case = handshake.timeouts[0] + sum(pauses) + handshake.timeouts[1]
-    assert worst_case < 20
+    # 20 - 15 - 0.5 = 4.5 s left; halved is 2.25 s, below the configured 3 s
+    assert handshake.timeouts == [15, 2.25]
+
+
+def test_a_slow_provider_that_used_the_whole_window_is_not_retried(make_auth_data, pauses):
+    """An rpc timeout is a limit per wait, so one slow attempt can take about twice the timeout. By then the
+    client has given up and reconnects, and a retry would only hold an auth worker for nobody."""
+    handshake = _Handshake([_Slow(30), _authorized()])
+
+    auth_data = make_auth_data(handshake)
+
+    assert handshake.calls == 1
+    assert handshake.timeouts == [15]
+    assert pauses == []
+    assert (auth_data.type, auth_data.id) == ("public", "-")
+
+
+def test_a_retry_that_would_get_less_than_a_second_is_not_made(make_auth_data):
+    handshake = _Handshake([_Slow(17.9), _authorized()])
+
+    make_auth_data(handshake)
+
+    # 20 - 17.9 - 0.5 = 1.6 s left; halved is 0.8 s, under the one second minimum
+    assert handshake.calls == 1
+
+
+def test_the_retry_cannot_push_the_handshake_past_the_window(make_auth_data, pauses):
+    """Each retry wait is at most half of what is left, and a slow provider can use it twice."""
+    for first in (0.1, 5, 10, 14, 15, 16, 17):
+        handshake = _Handshake([_Slow(first), _Slow(1000)])
+        handshake.now = 0.0
+
+        make_auth_data(handshake)
+
+        if handshake.calls == 2:
+            retry_wait = handshake.timeouts[1]
+            assert first + 0.5 + 2 * retry_wait <= handshake.sio_authorize_budget_s + 1e-9
 
 
 def test_there_is_a_pause_before_the_second_attempt_and_none_before_the_first(make_auth_data, pauses):

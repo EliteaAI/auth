@@ -35,6 +35,9 @@ from pylon.core.tools import log  # pylint: disable=E0611,E0401
 from pylon.core.tools import module  # pylint: disable=E0611,E0401
 from pylon.core.tools.context import Context as Holder  # pylint: disable=E0611,E0401
 
+# A retry of the handshake authorize call that would get less than this per wait is not worth making
+SIO_AUTHORIZE_MIN_RETRY_TIMEOUT_S = 1.0
+
 from pydantic import ValidationError  # pylint: disable=E0401
 
 from .models.pd.identity import EVIDENCE_ADAPTER
@@ -240,11 +243,15 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         self.permissions_rpc_deadline_s = 60.0
         self.permissions_retry_sleep_s = 1.0
         # The socket handshake authorizes once and keeps the result for the socket's whole life, so a failed
-        # call gets one more try. The client gives up connecting after 20 s, so the worst case has to stay
-        # below that: 15 s for the first call, then this pause and this shorter timeout for the second.
-        # Config keys "sio_authorize_retry_delay_s" and "sio_authorize_retry_timeout_s".
+        # call gets one more try, but only while the handshake is still inside the time the client waits
+        # (it gives up connecting after 20 s). An rpc timeout is a limit per wait, not a total: a provider
+        # that answers discovery and then the request too slowly costs up to twice the timeout. The retry
+        # is therefore sized from what is left of the budget, halved, and skipped when too little is left.
+        # Config keys "sio_authorize_budget_s", "sio_authorize_retry_delay_s", "sio_authorize_retry_timeout_s".
+        self.sio_authorize_budget_s = 20.0
         self.sio_authorize_retry_delay_s = 0.5
         self.sio_authorize_retry_timeout_s = 3
+        self._sio_authorize_clock = time.monotonic
         self.counters = {
             "auth_epoch_mismatch_total": SecurityCounter(
                 "auth_epoch_mismatch_total",
@@ -589,6 +596,9 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         )
         self.permissions_rpc_deadline_s = float(
             self.descriptor.config.get("permissions_rpc_deadline_s", self.permissions_rpc_deadline_s)
+        )
+        self.sio_authorize_budget_s = float(
+            self.descriptor.config.get("sio_authorize_budget_s", self.sio_authorize_budget_s)
         )
         self.sio_authorize_retry_delay_s = float(
             self.descriptor.config.get("sio_authorize_retry_delay_s", self.sio_authorize_retry_delay_s)
@@ -1334,15 +1344,30 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
                 # user anonymous until the page is refreshed, so the call gets a second chance first.
                 # This is a stopgap: two failures in a row still leave an anonymous socket, which the
                 # server answers on the first send (socket_unauthenticated) and the client repairs.
-                # The second attempt is short and comes after a pause, so a mass reconnect while the
-                # auth service is down does not hold every handshake for twice as long.
+                # The retry never stretches the handshake past the client's waiting time: it comes after
+                # a pause, with a timeout taken from the time left (halved, because the limit applies per
+                # wait and a slow provider can use it twice), and is skipped when too little is left. The
+                # first attempt is unchanged and can use that time by itself. Nothing cancels an abandoned
+                # request, so the first one may still be running on pylon_auth while the retry is sent.
+                started = self._sio_authorize_clock()
                 for attempt in (1, 2):
-                    if attempt == 2:
+                    if attempt == 1:
+                        timeout = 15
+                    else:
+                        left = (
+                            self.sio_authorize_budget_s
+                            - (self._sio_authorize_clock() - started)
+                            - self.sio_authorize_retry_delay_s
+                        )
+                        timeout = min(self.sio_authorize_retry_timeout_s, left / 2)
+                        if timeout < SIO_AUTHORIZE_MIN_RETRY_TIMEOUT_S:
+                            log.warning("SIO handshake authorize not retried: no time left in the handshake")
+                            break
                         time.sleep(self.sio_authorize_retry_delay_s)
                     try:
-                        auth_status = self.context.rpc_manager.timeout(
-                            15 if attempt == 1 else self.sio_authorize_retry_timeout_s
-                        ).auth_authorize(source, headers, cookies)
+                        auth_status = self.context.rpc_manager.timeout(timeout).auth_authorize(
+                            source, headers, cookies
+                        )
                         # Cache successful auth results
                         if cache_key and auth_status.get("auth_ok"):
                             self._set_cached_auth(cache_key, auth_status)
