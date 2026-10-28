@@ -239,6 +239,12 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         # up; past the deadline the module fails as before. Config "permissions_rpc_deadline_s".
         self.permissions_rpc_deadline_s = 60.0
         self.permissions_retry_sleep_s = 1.0
+        # The socket handshake authorizes once and keeps the result for the socket's whole life, so a failed
+        # call gets one more try. The client gives up connecting after 20 s, so the worst case has to stay
+        # below that: 15 s for the first call, then this pause and this shorter timeout for the second.
+        # Config keys "sio_authorize_retry_delay_s" and "sio_authorize_retry_timeout_s".
+        self.sio_authorize_retry_delay_s = 0.5
+        self.sio_authorize_retry_timeout_s = 3
         self.counters = {
             "auth_epoch_mismatch_total": SecurityCounter(
                 "auth_epoch_mismatch_total",
@@ -583,6 +589,12 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         )
         self.permissions_rpc_deadline_s = float(
             self.descriptor.config.get("permissions_rpc_deadline_s", self.permissions_rpc_deadline_s)
+        )
+        self.sio_authorize_retry_delay_s = float(
+            self.descriptor.config.get("sio_authorize_retry_delay_s", self.sio_authorize_retry_delay_s)
+        )
+        self.sio_authorize_retry_timeout_s = float(
+            self.descriptor.config.get("sio_authorize_retry_timeout_s", self.sio_authorize_retry_timeout_s)
         )
         # Identity verification (C-1009, #6756): nothing is configured unless the
         # "identity_verifier" section is present
@@ -1320,11 +1332,17 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
                 # A socket is authenticated once, at handshake, and the result is kept for its whole
                 # life. One failed call (auth service restarting, network flapping) would leave a valid
                 # user anonymous until the page is refreshed, so the call gets a second chance first.
+                # This is a stopgap: two failures in a row still leave an anonymous socket, which the
+                # server answers on the first send (socket_unauthenticated) and the client repairs.
+                # The second attempt is short and comes after a pause, so a mass reconnect while the
+                # auth service is down does not hold every handshake for twice as long.
                 for attempt in (1, 2):
+                    if attempt == 2:
+                        time.sleep(self.sio_authorize_retry_delay_s)
                     try:
-                        auth_status = self.context.rpc_manager.timeout(15).auth_authorize(
-                            source, headers, cookies
-                        )
+                        auth_status = self.context.rpc_manager.timeout(
+                            15 if attempt == 1 else self.sio_authorize_retry_timeout_s
+                        ).auth_authorize(source, headers, cookies)
                         # Cache successful auth results
                         if cache_key and auth_status.get("auth_ok"):
                             self._set_cached_auth(cache_key, auth_status)

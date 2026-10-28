@@ -37,6 +37,8 @@ class _Handshake:
 
     def __init__(self, outcomes, cached=None):
         self.auth_mode = "rpc"
+        self.sio_authorize_retry_delay_s = 0.5
+        self.sio_authorize_retry_timeout_s = 3
         self.outcomes = list(outcomes)
         self.calls = 0
         self.cached = cached
@@ -67,7 +69,15 @@ class _Handshake:
 
 
 @pytest.fixture
-def make_auth_data(auth_module, monkeypatch):
+def pauses(auth_module, monkeypatch):
+    """Record the pauses instead of sleeping them."""
+    recorded = []
+    monkeypatch.setattr(auth_module.time, "sleep", recorded.append)
+    return recorded
+
+
+@pytest.fixture
+def make_auth_data(auth_module, monkeypatch, pauses):  # pylint: disable=W0613
     monkeypatch.setattr(auth_module.flask, "Request", _FakeRequest, raising=False)
 
     def run(handshake):
@@ -125,12 +135,47 @@ def test_a_refusal_is_an_answer_and_is_not_retried(make_auth_data):
     assert handshake.calls == 1
 
 
-def test_each_attempt_keeps_the_original_timeout(make_auth_data):
+def test_the_second_attempt_is_shorter_so_the_handshake_stays_inside_the_client_limit(make_auth_data):
     handshake = _Handshake([queue.Empty(), _authorized()])
 
     make_auth_data(handshake)
 
-    assert handshake.timeouts == [15, 15]
+    # The first call keeps its 15 s. The client gives up after 20 s, so the retry cannot be another 15 s.
+    assert handshake.timeouts == [15, 3]
+
+
+def test_the_worst_case_stays_below_the_client_connect_limit(make_auth_data, pauses):
+    handshake = _Handshake([queue.Empty(), queue.Empty()])
+
+    make_auth_data(handshake)
+
+    worst_case = handshake.timeouts[0] + sum(pauses) + handshake.timeouts[1]
+    assert worst_case < 20
+
+
+def test_there_is_a_pause_before_the_second_attempt_and_none_before_the_first(make_auth_data, pauses):
+    handshake = _Handshake([queue.Empty(), _authorized()])
+
+    make_auth_data(handshake)
+
+    assert pauses == [0.5]
+
+
+def test_a_first_attempt_that_works_does_not_pause(make_auth_data, pauses):
+    make_auth_data(_Handshake([_authorized()]))
+
+    assert pauses == []
+
+
+def test_the_retry_settings_can_be_changed(make_auth_data, pauses):
+    handshake = _Handshake([queue.Empty(), _authorized()])
+    handshake.sio_authorize_retry_delay_s = 2
+    handshake.sio_authorize_retry_timeout_s = 5
+
+    make_auth_data(handshake)
+
+    assert handshake.timeouts == [15, 5]
+    assert pauses == [2]
 
 
 def test_only_a_successful_result_is_cached(make_auth_data):
