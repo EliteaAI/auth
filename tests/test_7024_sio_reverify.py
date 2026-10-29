@@ -10,6 +10,7 @@ request it connected with, and the next membership check authorizes it again. A 
 answer (an expired cookie) is final: the same cookie would get the same answer.
 """
 import queue
+import threading
 import types
 
 import pytest
@@ -56,6 +57,7 @@ class _Plugin:
         module = auth_module.Module
         self.auth_mode = "rpc"
         self.sio_reverify_min_interval_s = 5.0
+        self.sio_reverify_timeout_s = 5.0
         self.sio_users = {}
         self.clock = _Clock()
         self._sio_clock = self.clock
@@ -66,7 +68,11 @@ class _Plugin:
         self.cache_writes = []
         self.suspended = False
         self.members = {(42, 1)}
+        # Called from inside _authorize to simulate a concurrent send arriving mid-call.
+        # Must be used with _run_during_call(), which fires it on a separate thread, because
+        # the new code blocks concurrent callers on a threading.Event until the call completes.
         self.during_call = None
+        self._during_call_done = threading.Event()
         rpc = types.SimpleNamespace(timeout=self._timeout)
         self.context = types.SimpleNamespace(url_prefix="", rpc_manager=rpc)
         for name in ("_sio_authorize", "_sio_reverify", "sio_make_auth_data", "is_sio_user_in_project"):
@@ -80,11 +86,30 @@ class _Plugin:
     def _authorize(self, *_args):
         self.calls += 1
         if self.during_call:
-            self.during_call()
+            # Fire on a separate thread: the new code blocks concurrent callers on an Event until
+            # this call returns, so calling is_sio_user_in_project from inside _authorize would
+            # deadlock in a single-threaded test.
+            t = threading.Thread(target=self.during_call)
+            t.start()
+            self._during_call_done.wait(timeout=2)
+            t.join(timeout=2)
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
+
+    def _run_during_call(self, fn):
+        """Set up fn to run on a thread once _authorize is entered, and collect what it returns."""
+        results = []
+        done = threading.Event()
+
+        def wrapper():
+            results.append(fn())
+            done.set()
+            self._during_call_done.set()
+
+        self.during_call = wrapper
+        return results, done
 
     def _get_auth_cache_key(self, _cookies, _headers):
         return "auth:token:key"
@@ -163,6 +188,18 @@ def test_the_handshake_makes_one_call_and_does_not_retry(plugin):
     # A retry held the handshake for up to twice as long and only helped outages shorter than itself
     assert p.calls == 1
     assert p.timeouts == [15]
+
+
+def test_reverify_uses_a_shorter_timeout_than_the_handshake(plugin):
+    """The reverify RPC runs on the send path; a shorter timeout bounds how long the sender waits."""
+    p = plugin([queue.Empty(), _authorized("42")])
+    p.sio_reverify_timeout_s = 3.0
+    p.connect()
+
+    p.is_sio_user_in_project("sid-1", 1)
+
+    # First timeout is the handshake (15s), second is the reverify (3s)
+    assert p.timeouts == [15, 3.0]
 
 
 def test_a_cached_answer_skips_the_call(plugin):
@@ -296,20 +333,41 @@ def test_it_tries_again_once_the_interval_has_passed(plugin):
     assert p.calls == 3
 
 
-def test_a_second_send_that_arrives_during_the_call_does_not_start_another(plugin):
+def test_a_second_send_during_the_call_waits_for_it_and_does_not_start_another(plugin):
+    """The second send must wait, not be refused immediately.  An immediate refusal makes the client
+    re-handshake, which changes the socket id and makes the in-flight call's result land on nobody."""
     p = plugin([queue.Empty(), _authorized("42")])
     p.connect()
-    inner = []
-
-    def second_send():
-        inner.append(p.is_sio_user_in_project("sid-1", 1))
-
-    p.during_call = second_send
     p.clock.now += 6
-    p.is_sio_user_in_project("sid-1", 1)
 
+    inner, done = p._run_during_call(lambda: p.is_sio_user_in_project("sid-1", 1))
+    p.is_sio_user_in_project("sid-1", 1)
+    done.wait(timeout=2)
+
+    # The outer call verified the socket; after it completes the inner call sees a verified user
     assert p.calls == 2
-    assert inner == [False]
+    assert inner == [True]
+
+
+def test_a_second_send_after_the_interval_during_a_slow_call_also_waits(plugin):
+    """Even when the clock advances past the interval inside the call (simulating a slow auth service),
+    the in-flight event prevents a concurrent call from starting."""
+    p = plugin([queue.Empty(), _authorized("42")])
+    p.connect()
+    p.clock.now += 6
+
+    def slow_second_send():
+        # Advance clock as if the call took longer than sio_reverify_min_interval_s
+        p.clock.now += p.sio_reverify_min_interval_s + 1
+        return p.is_sio_user_in_project("sid-1", 1)
+
+    inner, done = p._run_during_call(slow_second_send)
+    p.is_sio_user_in_project("sid-1", 1)
+    done.wait(timeout=2)
+
+    # Still only two calls (connect + reverify), not three
+    assert p.calls == 2
+    assert inner == [True]
 
 
 def test_a_verified_user_is_never_authorized_again(plugin):
@@ -334,10 +392,13 @@ def test_a_verified_user_outside_the_project_is_refused_without_a_call(plugin):
 def test_a_socket_that_disconnects_during_the_call_is_not_brought_back(plugin):
     p = plugin([queue.Empty(), _authorized("42")])
     p.connect()
-    p.during_call = lambda: p.sio_users.pop("sid-1")
     p.clock.now += 6
 
-    assert p.is_sio_user_in_project("sid-1", 1) is False
+    _, done = p._run_during_call(lambda: p.sio_users.pop("sid-1"))
+    result = p.is_sio_user_in_project("sid-1", 1)
+    done.wait(timeout=2)
+
+    assert result is False
     assert "sid-1" not in p.sio_users
 
 
