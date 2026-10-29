@@ -22,6 +22,7 @@ import time
 import json
 import hashlib
 import functools
+import threading
 from typing import Optional
 
 import flask  # pylint: disable=E0401
@@ -239,6 +240,14 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         # up; past the deadline the module fails as before. Config "permissions_rpc_deadline_s".
         self.permissions_rpc_deadline_s = 60.0
         self.permissions_retry_sleep_s = 1.0
+        # A socket is authorized once, when it connects. When that call fails (the auth service is down or
+        # slow) the socket is kept as "unverified" with its handshake request, and is authorized again by
+        # the next membership check, at most this often. Config key "sio_reverify_min_interval_s".
+        self.sio_reverify_min_interval_s = 5.0
+        # Timeout for a re-authorization call made at send time. Shorter than the 15s handshake timeout
+        # because it blocks the send path directly. Config key "sio_reverify_timeout_s".
+        self.sio_reverify_timeout_s = 5.0
+        self._sio_clock = time.monotonic
         self.counters = {
             "auth_epoch_mismatch_total": SecurityCounter(
                 "auth_epoch_mismatch_total",
@@ -583,6 +592,12 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         )
         self.permissions_rpc_deadline_s = float(
             self.descriptor.config.get("permissions_rpc_deadline_s", self.permissions_rpc_deadline_s)
+        )
+        self.sio_reverify_min_interval_s = float(
+            self.descriptor.config.get("sio_reverify_min_interval_s", self.sio_reverify_min_interval_s)
+        )
+        self.sio_reverify_timeout_s = float(
+            self.descriptor.config.get("sio_reverify_timeout_s", self.sio_reverify_timeout_s)
         )
         # Identity verification (C-1009, #6756): nothing is configured unless the
         # "identity_verifier" section is present
@@ -1283,6 +1298,90 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
     # Tools: SIO
     #
 
+    def _sio_authorize(self, source, headers, cookies, rpc_timeout=15):
+        """ SIO: authorize a handshake request (Redis cache first, then the auth service) """
+        cache_key = self._get_auth_cache_key(cookies, headers)
+        auth_status = self._get_cached_auth(cache_key) if cache_key else None
+        if auth_status is None:
+            auth_status = self.context.rpc_manager.timeout(rpc_timeout).auth_authorize(source, headers, cookies)
+            # Cache successful auth results
+            if cache_key and auth_status.get("auth_ok"):
+                self._set_cached_auth(cache_key, auth_status)
+        return auth_status
+
+    @staticmethod
+    def _sio_auth_data_from_status(auth_status):
+        """ SIO: auth data from an answer of the auth service """
+        auth_data = Holder()
+        if auth_status["auth_ok"]:
+            auth_data.type = auth_status["headers"].get("X-Auth-Type", "public")
+            auth_data.id = auth_status["headers"].get("X-Auth-ID", "-")
+            auth_data.reference = auth_status["headers"].get("X-Auth-Reference", "-")
+            #
+            try:
+                auth_data.id = int(auth_data.id)
+            except:  # pylint: disable=W0702
+                auth_data.id = "-"
+        else:  # Note: may handle other cases (like 'redirect') later
+            auth_data.type = "public"
+            auth_data.id = "-"
+            auth_data.reference = "-"
+        return auth_data
+
+    def _sio_reverify(self, sid):
+        """ SIO: authorize a socket again when its handshake authorization failed
+
+        Only a socket marked unverified is touched. A socket the auth service answered "not authorized" for
+        is not retried: the same cookie would get the same answer.
+
+        When a call is already in flight for this socket, the caller waits for it to finish instead of
+        returning immediately. An immediate refusal would make the client re-handshake and change the
+        socket id, which would make the in-flight call's result land on a socket that no longer exists.
+        """
+        auth_data = self.sio_users.get(sid)
+        if auth_data is None or not getattr(auth_data, "unverified", False):
+            return
+        #
+        # If a reverify is already running for this socket, wait for it to finish and then re-read the
+        # socket's auth state, which the completing call may have upgraded.
+        in_flight_event = getattr(auth_data, "verify_in_flight_event", None)
+        if in_flight_event is not None:
+            in_flight_event.wait(timeout=self.sio_reverify_timeout_s)
+            return
+        #
+        now = self._sio_clock()
+        last = getattr(auth_data, "verify_attempted_at", None)
+        if last is not None and now - last < self.sio_reverify_min_interval_s:
+            return
+        #
+        # Signal to concurrent senders that a call is in flight. They will wait on the event rather
+        # than starting their own call and potentially exhausting auth workers.
+        event = threading.Event()
+        auth_data.verify_in_flight_event = event
+        handshake = auth_data.handshake
+        try:
+            # Use a shorter timeout than the 15s handshake to bound how long the send path blocks.
+            auth_status = self._sio_authorize(
+                handshake["source"], handshake["headers"], handshake["cookies"],
+                rpc_timeout=self.sio_reverify_timeout_s,
+            )
+        except:  # pylint: disable=W0702
+            log.warning("SIO re-verification of sid %s failed; it stays unverified", sid)
+            return
+        finally:
+            # Unblock any senders waiting on this call, and record when it finished so the
+            # interval is measured from completion, not from when the call started.
+            event.set()
+            current = self.sio_users.get(sid)
+            if current is auth_data:
+                auth_data.verify_in_flight_event = None
+                auth_data.verify_attempted_at = self._sio_clock()
+        # The socket may have disconnected while the call waited
+        if self.sio_users.get(sid) is not auth_data:
+            return
+        # The replacement carries no handshake: the cookies are not kept once they have been used
+        self.sio_users[sid] = self._sio_auth_data_from_status(auth_status)
+
     def sio_make_auth_data(self, environ):
         """ SIO: make auth data """
         auth_data = Holder()
@@ -1307,45 +1406,21 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
             }
             headers = dict(req.headers.items())
             cookies = dict(req.cookies.items())
-            # Call authorize RPC (with Redis caching for performance)
-            auth_status = None
-            cache_key = self._get_auth_cache_key(cookies, headers)
-            #
-            # Try Redis cache first
-            if cache_key:
-                auth_status = self._get_cached_auth(cache_key)
-            #
-            # Cache miss - call RPC
-            if auth_status is None:
-                try:
-                    auth_status = self.context.rpc_manager.timeout(15).auth_authorize(
-                        source, headers, cookies
-                    )
-                    # Cache successful auth results
-                    if cache_key and auth_status.get("auth_ok"):
-                        self._set_cached_auth(cache_key, auth_status)
-                except:  # pylint: disable=W0702
-                    auth_data.type = "public"
-                    auth_data.id = "-"
-                    auth_data.reference = "-"
-                    auth_status = None  # Mark as handled
-            #
-            if auth_status is not None:
-                if auth_status["auth_ok"]:
-                    auth_data.type = auth_status["headers"].get("X-Auth-Type", "public")
-                    auth_data.id = auth_status["headers"].get("X-Auth-ID", "-")
-                    auth_data.reference = auth_status["headers"].get(
-                        "X-Auth-Reference", "-"
-                    )
-                    #
-                    try:
-                        auth_data.id = int(auth_data.id)
-                    except:  # pylint: disable=W0702
-                        auth_data.id = "-"
-                else:  # Note: may handle other cases (like 'redirect') later
-                    auth_data.type = "public"
-                    auth_data.id = "-"
-                    auth_data.reference = "-"
+            try:
+                auth_status = self._sio_authorize(source, headers, cookies)
+            except:  # pylint: disable=W0702
+                # The call failed (timeout, auth service restarting). That says nothing about the user, so
+                # the socket is not stored as a logged-out one: it is unverified, keeps what it needs to be
+                # checked again, and is authorized again by the next membership check. A clean "not
+                # authorized" answer is different and is handled by the status below.
+                log.warning("SIO handshake authorize failed; the socket stays unverified until it is re-checked")
+                auth_data.type = "public"
+                auth_data.id = "-"
+                auth_data.reference = "-"
+                auth_data.unverified = True
+                auth_data.handshake = {"source": source, "headers": headers, "cookies": cookies}
+                return auth_data
+            return self._sio_auth_data_from_status(auth_status)
         #
         elif self.auth_mode == "traefik":
             auth_data.type = environ.get("HTTP_X_AUTH_TYPE", "public")
@@ -1403,6 +1478,10 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
             return False
         #
         if self.is_project_suspended(project_id):
+            return False
+        #
+        self._sio_reverify(sid)
+        if sid not in self.sio_users:
             return False
         #
         current_user = self.current_user(
