@@ -1346,7 +1346,7 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         # socket's auth state, which the completing call may have upgraded.
         in_flight_event = getattr(auth_data, "verify_in_flight_event", None)
         if in_flight_event is not None:
-            in_flight_event.wait(timeout=self.sio_reverify_timeout_s)
+            in_flight_event.wait(timeout=2 * self.sio_reverify_timeout_s)
             return
         #
         now = self._sio_clock()
