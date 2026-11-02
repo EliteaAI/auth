@@ -223,3 +223,21 @@ def test_a_reverified_socket_is_held_to_the_scope_too(auth, sio):
     auth.register_token_scope_checker(PartsChecker())
     status = {"auth_ok": True, "headers": {"X-Auth-Type": "token", "X-Auth-ID": "10"}}
     assert auth._sio_token_scoped(auth._sio_auth_data_from_status(status)).type == "public"   # pylint: disable=W0212
+
+
+def test_an_unverified_token_socket_reverified_by_a_refusing_checker_stays_public(auth, sio):
+    """N-D1-3: the handshake call failed, so the socket waits unverified; when the next membership check authorizes it
+    again and the answer is an API token whose scope does not allow a socket, it becomes public and joins nothing."""
+    checker = PartsChecker()
+    auth.register_token_scope_checker(checker)
+    unverified = auth._sio_auth_data_from_status({"auth_ok": False, "headers": {}})   # pylint: disable=W0212
+    unverified.unverified = True
+    unverified.handshake = {"source": {}, "headers": {}, "cookies": {}}
+    auth.sio_users["sid-1"] = unverified
+    auth._sio_clock = lambda: 1000.0   # pylint: disable=W0212
+    auth._sio_authorize = lambda *a, **k: {"auth_ok": True, "headers": {"X-Auth-Type": "token", "X-Auth-ID": "10"}}
+
+    assert auth.is_sio_user_in_project("sid-1", 2) is False
+    holder = auth.sio_users["sid-1"]
+    assert (holder.type, holder.id) == ("public", "-") and not getattr(holder, "unverified", False)
+    assert checker.calls == [(10, ("sio.connect", "POST", {}, ""))] and sio.members == []
