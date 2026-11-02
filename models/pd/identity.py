@@ -38,8 +38,17 @@ class LegacyPatEvidence(_Frozen):
     token_id: StrictInt
 
 
+class ApiTokenEvidence(_Frozen):
+    """ A scoped, expiring API token (#7336): its id, its owner and the scope the token row names """
+    kind: Literal["api_token"]
+    token_id: StrictInt
+    user_id: StrictInt
+    projects: list[StrictInt] = Field(min_length=1)
+    operations: list[str] = Field(min_length=1)
+
+
 Evidence = Annotated[
-    Union[SessionUserEvidence, WorkloadEvidence, LegacyPatEvidence],
+    Union[SessionUserEvidence, WorkloadEvidence, LegacyPatEvidence, ApiTokenEvidence],
     Field(discriminator="kind"),
 ]
 EVIDENCE_ADAPTER = TypeAdapter(Evidence)
@@ -71,7 +80,7 @@ class AssertedUserEvidence(_Frozen):
 
 class VerifiedPrincipal(_Frozen):
     """ Who the evidence proved """
-    kind: Literal["user", "workload", "legacy_pat"]
+    kind: Literal["user", "workload", "legacy_pat", "api_token"]
     user_id: Optional[int] = None
     subject_ref: str
     evidence: Optional[

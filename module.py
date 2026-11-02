@@ -41,7 +41,7 @@ from pydantic import ValidationError  # pylint: disable=E0401
 from .models.pd.identity import EVIDENCE_ADAPTER
 from .models.pd.permissions import Permissions
 from .security_metrics_client import SecurityCounter
-from .utils.identity_verifier import IdentityVerifier, load_verifier_settings, rejection
+from .utils.identity_verifier import IdentityVerifier, load_verifier_settings, rejection, token_scope_of
 
 try:
     from tools import constants as c  # pylint: disable=E0401
@@ -219,6 +219,9 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         self.public_rules = []  # [rule]
         # Bearers another plugin issues and verifies itself (C-1009 #7214: the run token of a governed run), by prefix
         self.bearer_verifiers = {}  # prefix -> verifier(token, environ) -> dict
+        # What an API token may do on this request (C-1009 #7336), decided by the plugin that knows the governance
+        # profile; None: every token request passes as before
+        self.token_scope_checker = None  # checker(token_id) -> None | {"status", "code", "message"}
         # Caches
         self.get_user_permissions_cache = cachetools.TTLCache(maxsize=20480, ttl=60)
         self.get_token_permissions_cache = cachetools.TTLCache(maxsize=20480, ttl=60)
@@ -475,6 +478,13 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         if hasattr(result, "reason_code"):
             return {"ok": False, "reason_code": result.reason_code, "message": result.message}
         return {"ok": True, "principal": result.model_dump(mode="json")}
+
+    def token_scope(self, token_id) -> Optional[dict]:
+        """ ``{"projects", "operations", "user_id"}`` of a scoped API token (#7336), None for a legacy one
+
+        Reads the token row through the epoch-keyed cache; raises when it cannot be read.
+        """
+        return token_scope_of(self.get_token(token_id))
 
     def _identity_active(self, auth_type, auth_id) -> bool:
         """ May this session/token be admitted right now? """
@@ -856,6 +866,14 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
                 return self.access_denied_reply()
             self._make_public_g_auth()
         #
+        # What an admitted API token may do here (#7336): asked of the registered checker only
+        if flask.g.auth.type == "token" and isinstance(flask.g.auth.id, int) \
+                and self.token_scope_checker is not None:
+            refusal = self._apply_token_scope_checker(flask.g.auth.id)
+            if refusal is not None:
+                self._make_public_g_auth()
+                return refusal
+        #
         flask.g.visitor = Holder()
         #
         flask.g.visitor.ip = flask.request.remote_addr
@@ -941,6 +959,39 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
             {"error": result.get("code") or "INTERNAL_TOKEN_INVALID",
              "message": result.get("message") or "The request could not be verified."}, status)
 
+    def register_token_scope_checker(self, checker):
+        """ ``checker(token_id, request_parts=None)`` decides what an API token may do (C-1009 #7336): on the current
+        HTTP request, or on a synthetic one of a socket (``(endpoint, method, view_args, path, args, environ)``)
+
+        It returns None to let the request through, or ``{"status": 403|503, "code", "message"}`` to refuse it.
+        A checker that fails refuses the request (503). One checker; registering again replaces it.
+        """
+        if not callable(checker):
+            raise ValueError("a token scope checker must be callable")
+        self.token_scope_checker = checker
+
+    def unregister_token_scope_checker(self, checker=None):
+        """ Stop checking token requests (only ``checker``, when given) """
+        if checker is None or self.token_scope_checker is checker:
+            self.token_scope_checker = None
+
+    def _apply_token_scope_checker(self, token_id):
+        """ The refusal response of the token scope checker, or None """
+        try:
+            result = self.token_scope_checker(token_id)
+        except:  # pylint: disable=W0702
+            log.error("The token scope checker failed; the request is refused")
+            result = {"status": 503, "code": "DEPENDENCY_UNAVAILABLE",
+                      "message": "The request could not be checked right now; try again."}
+        if result is None:
+            return None
+        if not isinstance(result, dict):
+            result = {}
+        status = result.get("status") if result.get("status") in (403, 503) else 403
+        return flask.make_response(
+            {"error": result.get("code") or "TOKEN_SCOPE_OPERATION",
+             "message": result.get("message") or "This API token may not do that."}, status)
+
     @staticmethod
     def _make_public_g_auth():
         flask.g.auth.type = "public"
@@ -966,7 +1017,7 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
                 sid = _args[1]
                 environ = _args[2]
                 #
-                self.sio_users[sid] = self.sio_make_auth_data(environ)
+                self.sio_users[sid] = self._sio_token_scoped(self.sio_make_auth_data(environ), environ)
                 #
                 return func(*_args, **_kvargs)
 
@@ -1380,7 +1431,32 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         if self.sio_users.get(sid) is not auth_data:
             return
         # The replacement carries no handshake: the cookies are not kept once they have been used
-        self.sio_users[sid] = self._sio_auth_data_from_status(auth_status)
+        self.sio_users[sid] = self._sio_token_scoped(self._sio_auth_data_from_status(auth_status))
+
+    # The synthetic requests a socket of an API token is checked as (C-1009 #7336, C9-SEC-75): the connection, as a
+    # write that names no project, and each project a socket asks to act in, as a read of that project
+    SIO_CONNECT_REQUEST = ("sio.connect", "POST", {}, "", {})
+    SIO_PROJECT_ENDPOINT = "sio.project"
+
+    def _sio_token_allowed(self, auth_data, parts) -> bool:
+        """ May this socket's API token make this synthetic request? True for any other caller or without a checker """
+        if getattr(auth_data, "type", None) != "token" or not isinstance(getattr(auth_data, "id", None), int) \
+                or self.token_scope_checker is None:
+            return True
+        try:
+            return self.token_scope_checker(auth_data.id, parts) is None
+        except:  # pylint: disable=W0702
+            log.error("The token scope checker failed; the socket is refused")
+            return False
+
+    def _sio_token_scoped(self, auth_data, environ=None):
+        """ SIO: a socket opened with an API token whose scope does not allow it is a public socket (#7336) """
+        if self._sio_token_allowed(auth_data, (*self.SIO_CONNECT_REQUEST, environ or {})):
+            return auth_data
+        log.info("SIO: an API token's scope does not allow a socket; it is public")
+        public = Holder()
+        public.type, public.id, public.reference = "public", "-", "-"
+        return public
 
     def sio_make_auth_data(self, environ):
         """ SIO: make auth data """
@@ -1491,6 +1567,11 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         user_id = current_user.get("id", None)
         #
         if not user_id:
+            return False
+        #
+        # An API token's socket acts only in the token's projects (#7336, C9-SEC-75)
+        if not self._sio_token_allowed(
+                self.sio_users[sid], (self.SIO_PROJECT_ENDPOINT, "GET", {"project_id": project_id}, "", {}, {})):
             return False
         #
         return self.check_user_in_project(project_id, user_id)

@@ -75,7 +75,10 @@ class _Plugin:
         self._during_call_done = threading.Event()
         rpc = types.SimpleNamespace(timeout=self._timeout)
         self.context = types.SimpleNamespace(url_prefix="", rpc_manager=rpc)
-        for name in ("_sio_authorize", "_sio_reverify", "sio_make_auth_data", "is_sio_user_in_project"):
+        self.token_scope_checker = None   # no API token scope checker (#7336)
+        self.SIO_PROJECT_ENDPOINT, self.SIO_CONNECT_REQUEST = module.SIO_PROJECT_ENDPOINT, module.SIO_CONNECT_REQUEST
+        for name in ("_sio_authorize", "_sio_reverify", "sio_make_auth_data", "is_sio_user_in_project",
+                     "_sio_token_allowed", "_sio_token_scoped"):
             setattr(self, name, types.MethodType(getattr(module, name), self))
         self._sio_auth_data_from_status = module._sio_auth_data_from_status  # pylint: disable=W0212
 

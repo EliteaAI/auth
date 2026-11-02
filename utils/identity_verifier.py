@@ -1,6 +1,7 @@
 """ Identity verifier (C-1009, #6756)
 
-Turns identity evidence (a user session, a workload token, a legacy PAT) into a
+Turns identity evidence (a user session, a workload token, a legacy PAT, a scoped API
+token) into a
 VerifiedPrincipal or a TypedRejection. Nothing here is consulted unless the
 operator configures the "identity_verifier" section; with the section absent
 every kind that needs configuration is "not admitted" and PyJWT is never imported.
@@ -31,6 +32,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_
 from pylon.core.tools import log  # pylint: disable=E0611,E0401
 
 from ..models.pd.identity import (
+    ApiTokenEvidence,
     AssertedUserEvidence,
     Evidence,
     LegacyPatEvidence,
@@ -74,6 +76,30 @@ def _check_url(value: str, field: str, insecure_dev_http: bool) -> str:
     if parsed.scheme == "http" and insecure_dev_http and dev_host:
         return value
     raise ValueError(f"{field} must be an https URL (http only for localhost/*.localhost with insecure_dev_http)")
+
+
+# The operations a scoped API token may name (#7336); twin of auth_core rpc/tokens.py TOKEN_OPERATIONS
+TOKEN_OPERATIONS = ("run", "build", "admin")
+
+
+def token_scope_of(row) -> Optional[dict]:
+    """ ``{"projects", "operations", "user_id"}`` of a scoped API token row (#7336), else None
+
+    A token is scoped only when it expires and names at least one project and one known
+    operation; anything else (every token created before #7336) is a legacy token.
+    """
+    if not isinstance(row, Mapping) or row.get("expires") is None:
+        return None
+    projects, operations = row.get("scope_projects"), row.get("scope_operations")
+    if not isinstance(projects, list) or not projects or not isinstance(operations, list) or not operations:
+        return None
+    if not all(isinstance(item, int) and not isinstance(item, bool) for item in projects) \
+            or not all(item in TOKEN_OPERATIONS for item in operations):
+        return None
+    user_id = row.get("user_id")
+    if isinstance(user_id, bool) or not isinstance(user_id, int):
+        return None
+    return {"projects": list(projects), "operations": list(operations), "user_id": user_id}
 
 
 def rejection(code: str) -> TypedRejection:
@@ -301,8 +327,8 @@ class IdentityVerifier:
             self._key_sources[kind] = by_uri[kind_settings.jwks_uri]
 
     def configured(self, kind: str) -> bool:
-        """ Can this kind be verified at all? (legacy_pat needs no settings) """
-        if kind == "legacy_pat":
+        """ Can this kind be verified at all? (legacy_pat and api_token need no settings) """
+        if kind in ("legacy_pat", "api_token"):
             return True
         return kind in ("session_user", "workload") and getattr(self.settings, kind) is not None
 
@@ -319,6 +345,8 @@ class IdentityVerifier:
                 return self._verify_workload(evidence)
             if isinstance(evidence, LegacyPatEvidence):
                 return self._verify_legacy_pat(evidence)
+            if isinstance(evidence, ApiTokenEvidence):
+                return self._verify_api_token(evidence)
             raise _Reject("IDENTITY_EVIDENCE_MISSING")
         except _Reject as rejected:
             log.info("Identity rejected: kind=%s code=%s", kind, rejected.code)
@@ -413,6 +441,32 @@ class IdentityVerifier:
             evidence=AssertedUserEvidence(
                 type="asserted_user", issuer="elitea:pat", subject=f"user:{user_id}",
             ),
+            epochs={"user": epochs.get("user"), "token": epochs.get("token")},
+        )
+
+    def _verify_api_token(self, evidence: ApiTokenEvidence) -> VerifiedPrincipal:
+        """ A scoped API token (#7336): live (token and owner epochs, expiry), its owner the evidence's user, and its
+        row still the scope the evidence names. The platform vouches for the owner: an asserted user """
+        epochs = self._active_epochs("token", evidence.token_id)
+        user_id = epochs.get("user_id")
+        if isinstance(user_id, bool) or not isinstance(user_id, int):
+            raise _Reject("IDENTITY_REVOKED")
+        if user_id != evidence.user_id:
+            raise _Reject("IDENTITY_SUBJECT_UNLINKED")
+        row = self._rpc("get_token", evidence.token_id)
+        scope = token_scope_of(row)
+        if scope is None or scope != {"projects": evidence.projects, "operations": evidence.operations,
+                                      "user_id": user_id}:
+            raise _Reject("IDENTITY_EVIDENCE_MISSING")
+        expires = row["expires"]
+        return VerifiedPrincipal(
+            kind="api_token",
+            user_id=user_id,
+            subject_ref=f"user:{user_id}",
+            evidence=AssertedUserEvidence(
+                type="asserted_user", issuer="elitea:api_token", subject=f"user:{user_id}",
+            ),
+            expires_at=expires if isinstance(expires, datetime) else None,
             epochs={"user": epochs.get("user"), "token": epochs.get("token")},
         )
 
