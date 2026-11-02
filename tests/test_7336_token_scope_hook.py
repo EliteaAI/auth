@@ -150,3 +150,76 @@ def test_an_invalid_scope_is_a_readable_refusal(token_api, expires, projects, op
     moment = {"soon": soon(), "far": soon(91), "past": soon(-1)}.get(expires, expires) \
         if isinstance(expires, str) else expires
     assert fragment in token_api._scope_error(9, moment, projects, operations)   # pylint: disable=W0212
+
+
+# --- Socket.IO (C9-SEC-75): the handshake and every project a socket acts in ----------------------------------------
+
+class PartsChecker:
+    """Refuses what the scope (projects, operations) of token 10 does not allow; records the synthetic requests."""
+
+    def __init__(self, admin=False, projects=(2,)):
+        self.admin, self.projects, self.calls = admin, projects, []
+
+    def __call__(self, token_id, parts=None):
+        self.calls.append((token_id, parts[:4] if parts else None))
+        endpoint, _method, view_args = parts[0], parts[1], parts[2]
+        if endpoint == "sio.connect":
+            return None if self.admin else {"status": 403, "code": "TOKEN_SCOPE_OPERATION", "message": "no"}
+        return None if view_args.get("project_id") in self.projects else {"status": 403, "code": "TOKEN_SCOPE_PROJECT",
+                                                                          "message": "no"}
+
+
+@pytest.fixture
+def sio(auth):
+    auth.auth_mode = "traefik"
+    members = []
+    auth.is_project_suspended = lambda project_id: False
+    auth.current_user = lambda auth_data=None: {"id": 1} if getattr(auth_data, "type", None) in ("user", "token") else {}
+    auth.check_user_in_project = lambda project_id, user_id: members.append((project_id, user_id)) or True
+
+    def connect(kind="token", ident="10"):
+        environ = {"HTTP_X_AUTH_TYPE": kind, "HTTP_X_AUTH_ID": ident}
+        auth._decorator_sio_connect()(lambda *a, **k: True)(None, "sid-1", environ)   # pylint: disable=W0212
+        return auth.sio_users["sid-1"]
+
+    return types.SimpleNamespace(connect=connect, members=members)
+
+
+def test_a_socket_of_a_token_whose_scope_lacks_admin_is_public(auth, sio):
+    checker = PartsChecker()
+    auth.register_token_scope_checker(checker)
+    holder = sio.connect()
+    assert (holder.type, holder.id) == ("public", "-")
+    assert checker.calls == [(10, ("sio.connect", "POST", {}, ""))]   # asked as a write that names no project
+    assert auth.is_sio_user_in_project("sid-1", 2) is False and sio.members == []
+
+
+def test_an_admin_scoped_tokens_socket_acts_in_its_projects_only(auth, sio):
+    checker = PartsChecker(admin=True)
+    auth.register_token_scope_checker(checker)
+    holder = sio.connect()
+    assert (holder.type, holder.id) == ("token", 10)
+    assert auth.is_sio_user_in_project("sid-1", 2) is True and sio.members == [(2, 1)]
+    assert auth.is_sio_user_in_project("sid-1", 5) is False and sio.members == [(2, 1)]   # no membership read
+    assert checker.calls[-1] == (10, ("sio.project", "GET", {"project_id": 5}, ""))
+
+
+def test_a_failing_checker_makes_the_token_socket_public(auth, sio):
+    auth.register_token_scope_checker(Checker(RuntimeError("boom")))
+    assert sio.connect().type == "public"
+
+
+def test_sockets_without_a_checker_or_of_a_session_are_unchanged(auth, sio):
+    holder = sio.connect()   # no checker: as before
+    assert (holder.type, holder.id) == ("token", 10) and auth.is_sio_user_in_project("sid-1", 5) is True
+    checker = PartsChecker()
+    auth.register_token_scope_checker(checker)
+    holder = sio.connect(kind="user", ident="1")
+    assert (holder.type, holder.id) == ("user", 1) and auth.is_sio_user_in_project("sid-1", 5) is True
+    assert checker.calls == []
+
+
+def test_a_reverified_socket_is_held_to_the_scope_too(auth, sio):
+    auth.register_token_scope_checker(PartsChecker())
+    status = {"auth_ok": True, "headers": {"X-Auth-Type": "token", "X-Auth-ID": "10"}}
+    assert auth._sio_token_scoped(auth._sio_auth_data_from_status(status)).type == "public"   # pylint: disable=W0212

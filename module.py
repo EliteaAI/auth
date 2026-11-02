@@ -960,7 +960,8 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
              "message": result.get("message") or "The request could not be verified."}, status)
 
     def register_token_scope_checker(self, checker):
-        """ ``checker(token_id)`` decides what an API token may do on the current request (C-1009 #7336)
+        """ ``checker(token_id, request_parts=None)`` decides what an API token may do (C-1009 #7336): on the current
+        HTTP request, or on a synthetic one of a socket (``(endpoint, method, view_args, path, args, environ)``)
 
         It returns None to let the request through, or ``{"status": 403|503, "code", "message"}`` to refuse it.
         A checker that fails refuses the request (503). One checker; registering again replaces it.
@@ -1016,7 +1017,7 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
                 sid = _args[1]
                 environ = _args[2]
                 #
-                self.sio_users[sid] = self.sio_make_auth_data(environ)
+                self.sio_users[sid] = self._sio_token_scoped(self.sio_make_auth_data(environ), environ)
                 #
                 return func(*_args, **_kvargs)
 
@@ -1430,7 +1431,32 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         if self.sio_users.get(sid) is not auth_data:
             return
         # The replacement carries no handshake: the cookies are not kept once they have been used
-        self.sio_users[sid] = self._sio_auth_data_from_status(auth_status)
+        self.sio_users[sid] = self._sio_token_scoped(self._sio_auth_data_from_status(auth_status))
+
+    # The synthetic requests a socket of an API token is checked as (C-1009 #7336, C9-SEC-75): the connection, as a
+    # write that names no project, and each project a socket asks to act in, as a read of that project
+    SIO_CONNECT_REQUEST = ("sio.connect", "POST", {}, "", {})
+    SIO_PROJECT_ENDPOINT = "sio.project"
+
+    def _sio_token_allowed(self, auth_data, parts) -> bool:
+        """ May this socket's API token make this synthetic request? True for any other caller or without a checker """
+        if getattr(auth_data, "type", None) != "token" or not isinstance(getattr(auth_data, "id", None), int) \
+                or self.token_scope_checker is None:
+            return True
+        try:
+            return self.token_scope_checker(auth_data.id, parts) is None
+        except:  # pylint: disable=W0702
+            log.error("The token scope checker failed; the socket is refused")
+            return False
+
+    def _sio_token_scoped(self, auth_data, environ=None):
+        """ SIO: a socket opened with an API token whose scope does not allow it is a public socket (#7336) """
+        if self._sio_token_allowed(auth_data, (*self.SIO_CONNECT_REQUEST, environ or {})):
+            return auth_data
+        log.info("SIO: an API token's scope does not allow a socket; it is public")
+        public = Holder()
+        public.type, public.id, public.reference = "public", "-", "-"
+        return public
 
     def sio_make_auth_data(self, environ):
         """ SIO: make auth data """
@@ -1541,6 +1567,11 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
         user_id = current_user.get("id", None)
         #
         if not user_id:
+            return False
+        #
+        # An API token's socket acts only in the token's projects (#7336, C9-SEC-75)
+        if not self._sio_token_allowed(
+                self.sio_users[sid], (self.SIO_PROJECT_ENDPOINT, "GET", {"project_id": project_id}, "", {}, {})):
             return False
         #
         return self.check_user_in_project(project_id, user_id)
