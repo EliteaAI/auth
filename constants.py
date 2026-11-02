@@ -22,3 +22,8 @@
 # pylon and so cannot be imported here. The name is the only marker: there is
 # no dedicated column, which is why POST /token must reject it.
 SYSTEM_TOKEN_NAME = "elitea-system"
+
+# A scoped API token (C-1009, #7336) expires within this many days and names at most this
+# many projects. Twins of auth_core.rpc.tokens, which enforces them again on add_token.
+SCOPED_TOKEN_MAX_TTL_DAYS = 90
+SCOPED_TOKEN_MAX_PROJECTS = 100
