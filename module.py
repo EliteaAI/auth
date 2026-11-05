@@ -208,6 +208,7 @@ class Module(module.ModuleModel):  # pylint: disable=R0902
             ["get_project_user_permissions", "auth_get_project_user_permissions"],
             ["check_user_in_project", "auth_check_user_in_project"],
             ["check_user_in_projects", "auth_check_user_in_projects"],
+            ["list_user_project_ids", "auth_list_user_project_ids"],
             ["list_project_users", "auth_list_project_users"],
             ["apply_project_roles_snapshot", "auth_apply_project_roles_snapshot"],
         ]
